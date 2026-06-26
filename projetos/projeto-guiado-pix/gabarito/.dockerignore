@@ -1,0 +1,9 @@
+# Mantém o contexto de build enxuto
+**/target/
+**/.git/
+**/.idea/
+**/*.iml
+**/.DS_Store
+**/ESTADO.md
+**/README.md
+**/docs/

@@ -1,0 +1,22 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: comprovante-emissor
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+    default-property-inclusion: non_null
+  rabbitmq:
+    host: ${RABBIT_HOST:localhost}
+    port: ${RABBIT_PORT:5672}
+    username: ${RABBIT_USER:guest}
+    password: ${RABBIT_PASS:guest}
+
+# plano-b-jvm (esta turma): broker Qpid embarcado/local — confirmar no Nexus.  plano-a-docker (referência de produção): RabbitMQ via Docker.
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

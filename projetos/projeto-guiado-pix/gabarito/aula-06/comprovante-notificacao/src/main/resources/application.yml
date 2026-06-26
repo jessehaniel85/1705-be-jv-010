@@ -1,0 +1,22 @@
+server:
+  port: 8084
+
+spring:
+  application:
+    name: comprovante-notificacao
+  kafka:
+    bootstrap-servers: ${KAFKA:localhost:9092}
+    consumer:
+      group-id: notificacao
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: br.com.caixa.pix.contracts
+        spring.json.value.default.type: br.com.caixa.pix.contracts.ComprovanteGravadoEvent
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
