@@ -1,247 +1,270 @@
-# Material do Aluno — Aula 6: Tópicos / eventos com Kafka
+# Material do Aluno — Aula 6: Filas com RabbitMQ + idempotência e DLQ
 
-> **Tempo de leitura:** ~12 min. Esta aula muda o eixo do módulo: até aqui você mandava trabalho para ser feito (fila, comando, alguém consome **uma vez**). Agora você vai **publicar fatos** que muitos podem ler, no seu ritmo, inclusive no futuro. Essa distinção — trabalho × fato — é a diferença entre uma fila e um tópico, e ela reorganiza toda a arquitetura. Leia com atenção a seção da chave de partição: é o detalhe que mais derruba sistemas Kafka em produção.
-
----
-
-## 1. O problema: vários querem reagir ao mesmo fato
-
-No nosso projeto-guia, o `comprovante-gravador` acabou de persistir um comprovante PIX. Esse fato — "comprovante gravado" — interessa a várias áreas:
-
-- **Notificação** quer avisar o cliente ("seu comprovante está disponível").
-- **Antifraude** quer analisar o padrão da transação.
-- **BI** quer somar a métrica para o dashboard de volumetria.
-
-A solução ingênua é o gravador chamar os três: `notificacaoClient.enviar(...)`, `antifraudeClient.analisar(...)`, `biClient.registrar(...)`. Funciona até a primeira mudança. Amanhã entra uma quarta área (compliance), depois uma quinta (data lake). Cada nova reação obriga a **mexer no gravador** e a **subir o gravador de novo**. Pior: se a antifraude está fora do ar, a chamada síncrona dela pode travar a gravação — uma área secundária derrubando o coração do sistema.
-
-O gravador virou um **ponto de acoplamento que cresce sem parar**. Ele conhece todos os interessados, depende da disponibilidade de todos e carrega a responsabilidade de orquestrar todos. Isso é exatamente o oposto do que o DDD da Aula 1 nos ensinou: o emissor de um fato **não deveria conhecer** quem reage a ele.
-
-A inversão que resolve: em vez de o gravador **chamar** os interessados, ele **publica um fato** num lugar central — "comprovante gravado, aqui estão os dados" — e **quem se interessa que escute**. O gravador não sabe (e não quer saber) quantos consumidores existem. Adicionar um novo consumidor passa a ser uma operação que **não toca no produtor**. Esse "lugar central onde fatos são publicados e muitos leem" é um **tópico**.
+> **Tempo de leitura:** ~13 min. Na Aula 4 você desacoplou a emissão da gravação com uma fila "pronta". Agora abrimos a caixa-preta: como uma fila de verdade **roteia**, **confirma** e **isola** mensagens — e por que o tratamento de falha não é um detalhe de configuração, é o coração do design. O fio condutor é uma pergunta concreta: *quando a gravação do comprovante falha três vezes seguidas, a mensagem some?* A resposta — "nunca por acidente" — depende de cada peça desta aula. O exemplo trabalhado da seção 8 mostra como **provar** a DLQ com uma mensagem envenenada.
 
 ---
 
-## 2. Fila × tópico: a diferença que muda a arquitetura
+## 1. Dois tipos de falha que não podem ser tratados igual
 
-Esta é a distinção mais importante da aula. Fila e tópico parecem a mesma coisa — "lugar onde mensagens passam" — mas resolvem problemas opostos.
+A gravação do comprovante PIX falha de **dois jeitos fundamentalmente diferentes**, e a confusão entre eles é a origem de quase todo incidente de fila em produção:
 
-| | **Fila** (ex.: RabbitMQ) | **Tópico** (ex.: Kafka) |
+- **Falha transitória:** algo momentâneo. O banco oscilou durante um failover, a conexão caiu, houve um deadlock, o pool de conexões esgotou por um instante. A mensagem está **perfeita**; só teve azar de chegar num mau momento. **Tentar de novo resolve.**
+- **Falha permanente:** algo estrutural. A mensagem está malformada (um campo obrigatório nulo, um valor que viola uma constraint, um enum desconhecido por incompatibilidade de versão). Tentar de novo **nunca** vai resolver — vai falhar exatamente igual, para sempre.
+
+Tratar os dois do mesmo jeito leva a um de dois desastres:
+
+| Estratégia única | Consequência na falha transitória | Consequência na falha permanente |
 |---|---|---|
-| A mensagem é... | **trabalho** a ser feito | **fato** que aconteceu |
-| Consumida por... | **um** worker (entre vários concorrentes) | **vários** consumidores independentes |
-| Depois de processada | **some** (ack remove da fila) | **permanece** no log (retenção) |
-| Semântica | "faça isto" (comando) | "isto aconteceu" (evento) |
-| Quem conhece quem | produtor sabe que há trabalho a distribuir | produtor **ignora** quem consome |
-| Reprocessar o passado | impossível (já sumiu) | possível (**replay**) |
+| **Descartar ao primeiro erro** | perde comprovante bom por azar momentâneo — catastrófico | "limpa" a fila, mas perde o dado e a evidência do bug |
+| **Reprocessar para sempre** | correto: a próxima tentativa funciona | trava a fila num loop infinito de falha (a *poison message*) |
 
-Na **fila**, a mensagem é uma tarefa. Vários workers competem por ela, mas **apenas um** a pega — distribuir carga é o objetivo. Quando o worker confirma (ack), a mensagem desaparece. Foi exatamente o que usamos nas Aulas 4 e 5: "grave este comprovante" é um **comando**, um trabalho, consumido uma vez pelo gravador.
-
-No **tópico**, a mensagem é um fato registrado num **log**. Ela não é endereçada a ninguém; fica disponível. **Cada** consumidor interessado lê o log inteiro, no seu ritmo, mantendo seu próprio progresso. Notificação, antifraude e BI leem **os mesmos eventos**, de forma independente, sem disputar entre si e sem que um afete o outro.
-
-> Não existe "Kafka é melhor que RabbitMQ". São ferramentas para problemas diferentes. **Regra prática:** se a frase natural é um verbo no imperativo ("grave o comprovante"), é **comando → fila**. Se é um fato no passado ("comprovante foi gravado"), é **evento → tópico**. Repare que essa é a mesma distinção comando/evento do event storming da Aula 1 — o desenho do domínio já apontava onde usar cada um.
+A arquitetura certa **distingue** os dois: falha transitória → **retry com backoff** (tenta de novo, espaçado, algumas vezes); falha permanente → **Dead Letter Queue** (isola para inspeção humana, sem nunca descartar). O resto da aula é construir essa distinção peça por peça.
 
 ---
 
-## 3. O modelo mental do Kafka
+## 2. Anatomia do RabbitMQ: por que não se publica direto na fila
 
-Kafka não é uma "fila com superpoderes". É um **log distribuído, append-only**. Entender cinco peças destrava tudo o mais.
+A primeira surpresa de quem vem de uma `BlockingQueue` em memória: no RabbitMQ (e no AMQP em geral) o produtor **não publica numa fila**. Ele publica numa **exchange**, e a exchange decide para quais filas a mensagem vai. Há quatro peças:
 
-**Log append-only.** Um tópico é, na essência, um arquivo onde eventos só são **acrescentados ao fim**, nunca alterados nem removidos no meio. Cada evento ganha uma posição sequencial. Esse "só anexa" é o que torna o Kafka rápido (escrita sequencial em disco) e o que viabiliza o replay.
-
-**Partição.** Um tópico é dividido em **partições**, que são logs paralelos. Partição é a **unidade de paralelismo** (cada partição pode ser lida por uma instância diferente) **e a unidade de ordenação** (a ordem só é garantida *dentro* de uma partição). Um tópico `comprovante-gravado` com 6 partições aceita até 6 consumidores de um grupo lendo em paralelo.
-
-**Offset.** É a posição de leitura dentro de uma partição — um número que avança. O ponto crucial: **o offset pertence ao consumer group, não ao tópico**. O grupo `notificacao` está no offset 1.020 enquanto o grupo `bi` está no offset 340; cada um avança no seu ritmo, lendo os mesmos eventos. É por isso que múltiplos consumidores não interferem entre si.
-
-**Consumer group.** Um conjunto de instâncias que **dividem** as partições de um tópico entre si. Dentro de um grupo, cada partição é lida por **uma só** instância — é assim que o Kafka escala o consumo. Entre grupos diferentes, **cada grupo lê tudo**. Ou seja: dentro do grupo = distribuição de carga (como fila); entre grupos = broadcast (como tópico). Os dois comportamentos no mesmo mecanismo.
-
-**Replicação.** Cada partição é copiada em vários brokers (réplicas). Se o broker líder de uma partição cai, uma réplica assume. É o que dá a durabilidade que justifica usar o log como fonte da verdade.
+- **Exchange:** o ponto de entrada. Recebe a mensagem do produtor e a **roteia**. Não armazena nada.
+- **Queue (fila):** onde a mensagem **fica** até ser consumida. É a parte durável.
+- **Binding:** a "ligação" que conecta uma exchange a uma fila, com uma regra.
+- **Routing key:** o rótulo que o produtor põe na mensagem; a exchange compara a routing key com os bindings para decidir o destino.
 
 ```
-Tópico "comprovante-gravado", 3 partições:
-
-P0: [e0][e3][e6][e9]  ← append-only, offsets crescentes
-P1: [e1][e4][e7]
-P2: [e2][e5][e8][e10]
-
-Grupo "notificacao" (2 instâncias):  inst-A lê P0,P1 | inst-B lê P2
-Grupo "bi" (1 instância):            inst-C lê P0,P1,P2
-→ cada grupo tem seu próprio offset em cada partição
+            routing key = "comprovante.gravar"
+producer ─────────────────────────────▶ [ exchange ] ──binding──▶ [ fila gravacao.q ] ──▶ consumer
+                                              │
+                                              └──binding──▶ [ fila auditoria.q ] ──▶ consumer
 ```
 
----
+**Por que essa indireção?** Porque ela é exatamente o desacoplamento da Aula 3 sobre mensagem × evento, agora em infraestrutura. O produtor conhece a **intenção** (a exchange + a routing key), **não o consumidor**. Adicionar um segundo consumidor (uma fila de auditoria que também quer toda gravação) é criar um novo binding — **sem tocar no produtor**. Se o produtor publicasse direto na fila, ele estaria acoplado a cada consumidor existente. A exchange é o que torna o sistema extensível.
 
-## 4. A chave de partição: ordenação e o perigo da partição quente
+### Tipos de exchange
 
-A pergunta que decide a qualidade do seu design: **em qual partição um evento cai?** A resposta vem da **chave** da mensagem. O Kafka calcula `hash(chave) % número_de_partições`. Consequências diretas:
+A regra de roteamento depende do **tipo** da exchange:
 
-- **Mesma chave → mesma partição → ordem garantida** entre esses eventos.
-- **Chaves diferentes → partições possivelmente diferentes → sem garantia de ordem** entre elas.
-- **Chave nula → distribuição round-robin** (espalha, mas perde qualquer agrupamento por ordem).
+| Tipo | Regra de roteamento | Quando usar | Exemplo no PIX |
+|---|---|---|---|
+| **direct** | routing key **exata** = chave do binding | comando para um destino específico | `comprovante.gravar` → fila de gravação |
+| **topic** | padrão com curingas (`*` = uma palavra, `#` = várias) | roteamento por categoria/hierarquia | `comprovante.gravado` para BI; `comprovante.*` para auditoria |
+| **fanout** | **ignora** a routing key; replica para **todas** as filas ligadas | broadcast puro de um evento | "comprovante gravado" para notificação + antifraude + BI (Aula 6) |
+| **headers** | casa por atributos do cabeçalho em vez de routing key | roteamento por metadados complexos | raro; roteamento por região/tipo |
 
-No nosso domínio, a chave natural do tópico `comprovante-gravado` é o **`id` do comprovante**. Assim, todos os eventos de um mesmo comprovante (gravado, depois corrigido, depois reemitido) caem na mesma partição e são lidos **na ordem em que aconteceram**. Isso importa: notificar "comprovante corrigido" antes de "comprovante gravado" seria um bug.
-
-Mas a escolha da chave tem duas armadilhas clássicas:
-
-**Quebrar a ordem.** Se você precisa de ordem por comprovante mas usa o `id` do *cliente* como chave, dois comprovantes do mesmo cliente caem juntos — talvez não seja o que você quer. Pior: se não usa chave nenhuma onde a ordem importa, dois eventos do mesmo comprovante podem ir para partições diferentes e ser processados fora de ordem. **Ordem no Kafka é por partição, e partição é decidida pela chave.** Não há ordem global "de graça".
-
-**Partição quente (hot partition).** Se a chave tem **baixa cardinalidade** ou é **enviesada**, uma partição recebe a maioria das mensagens. Exemplo perigoso: usar o `tipoChave` do PIX (CPF, e-mail, telefone, aleatória — só 4 valores) como chave do tópico. Com 6 partições, no máximo 4 são usadas, e se 80% dos PIX são por CPF, **uma partição recebe 80% da carga**. Aquele consumidor satura enquanto os outros ficam ociosos — você comprou paralelismo e não pode usá-lo. Boa chave de partição tem **alta cardinalidade e distribuição equilibrada**; o `id` (UUID) do comprovante é ideal.
-
-> Resumo que vale ouro numa banca: **a chave controla simultaneamente a ordenação e o balanceamento.** Escolha pensando em "o que precisa ser lido em ordem" e "o que distribui bem". Quando esses dois objetivos brigam, é sinal de que o modelo de eventos precisa de revisão.
+Para a **fila de gravação** (um comando, um destino), o tipo certo é **direct**: a routing key `comprovante.gravar` cai exatamente na fila do gravador. Quando, na Aula 6, o evento "comprovante gravado" precisar chegar a vários interessados de uma vez sem o produtor saber quem são, o tipo certo será **fanout** ou **topic**. Guarde o contraste: **direct para comando, fanout/topic para evento** — é a mesma distinção da Aula 4, materializada em exchange.
 
 ---
 
-## 5. Retenção e replay
+## 3. Ack, nack manual e redelivery
 
-Numa fila, a mensagem some quando é processada. No Kafka, **o evento permanece no log** por um período configurado (`retention.ms`) — dias, semanas, ou até "para sempre" em tópicos compactados. Consumir **não apaga**. Essa propriedade aparentemente simples destrava capacidades que a fila não tem.
+Por padrão, um consumidor poderia confirmar a mensagem **no momento em que a recebe** (auto-ack). Isso é perigoso: se o consumidor cai **depois** de receber e **antes** de gravar, a mensagem já foi confirmada e **se perde**. Para um comprovante, inaceitável.
 
-**Replay.** Você pode **reposicionar o offset** de um consumer group para trás e reprocessar eventos já lidos. Cenários reais:
+A configuração correta é **ack manual**: o consumidor confirma (**ack**) **só depois** de processar com sucesso. As três respostas possíveis ao broker:
 
-- A notificação tinha um bug que formatava a mensagem errada por 3 dias. Você corrige o código e **reprocessa os últimos 3 dias** — os eventos ainda estão lá.
-- O índice do BI corrompeu. Você reconstrói reprocessando o log desde o início, sem precisar de backup separado: **o log é o backup**.
-
-**Plugar um consumidor novo no passado.** Quando uma nova área (compliance) precisa reagir a comprovantes gravados, ela sobe um consumer group novo e começa a ler **do offset zero**. Ela "vê" toda a história que aconteceu **antes de existir**, sem que ninguém precise reenviar nada e sem afetar os consumidores existentes (cada grupo tem seu offset). Numa fila isso seria impossível: o passado já foi consumido e descartado.
-
----
-
-## 6. Event sourcing: o log como fonte da verdade
-
-Quando você leva a ideia do log retido até o fim, chega ao **event sourcing**: em vez de guardar apenas o **estado atual** ("comprovante está GRAVADO"), você guarda a **sequência de fatos** que levou a ele ("emitido", "aceito", "gravado", "consultado"). O estado atual passa a ser uma **projeção** — algo que você **calcula** reproduzindo os eventos, não algo que você armazena como verdade primária.
-
-Por que isso é poderoso:
-
-- **Auditoria nativa.** O log *é* a trilha de auditoria. Para um sistema financeiro como o da Caixa, poder responder "por que este comprovante está neste estado?" reproduzindo cada fato é um requisito, não um luxo.
-- **Reconstrução de estado.** Se a base de leitura corrompe ou você precisa de uma nova visão dos dados, reproduz os eventos e reconstrói. O passado é reproduzível.
-- **Múltiplas projeções do mesmo log.** Notificação, antifraude e BI são, cada um, uma **projeção diferente** do mesmo fluxo de eventos. Uma nova pergunta de negócio vira uma nova projeção — sem migração de schema.
-
-Event sourcing tem custo (complexidade, versionamento de eventos, *snapshots* para não reproduzir milhões de eventos toda vez) e nem todo sistema precisa dele. Mas o **modelo mental** — "o fato é a verdade, o estado é derivado" — é o que torna o Kafka mais que um cano de mensagens.
-
-> **Rebalance (em uma frase):** quando uma instância de um consumer group entra ou sai, o Kafka **redistribui as partições** entre as instâncias restantes (rebalance). Durante esse rearranjo o consumo pausa brevemente; por isso processamento idempotente importa — uma partição pode ser reprocessada a partir do último offset confirmado. Voltaremos à idempotência na próxima aula.
-
----
-
-## 7. Exemplo trabalhado: `comprovante-gravado` com três consumer groups
-
-Vamos do produtor aos três consumidores independentes, no nosso domínio.
-
-### Passo 1 — O evento (um fato, imutável)
-
-Um evento de domínio descreve algo que **já aconteceu**. Nome no passado, dados completos para quem reage não precisar voltar perguntar:
+- **ack (acknowledge):** "processei com sucesso, pode descartar a mensagem". O broker remove da fila.
+- **nack (negative ack) / reject:** "não consegui processar". Aqui há uma escolha crítica: `requeue=true` devolve a mensagem à fila (para nova tentativa); `requeue=false` **descarta ou envia para dead-letter** (veremos na seção 6).
+- **nenhuma resposta + queda do consumidor:** o broker não recebeu ack, então **reentrega** (redelivery) a mensagem — para o mesmo ou outro consumidor.
 
 ```java
-public record ComprovanteGravadoEvent(
-        UUID comprovanteId,
-        String chavePixDestino,
-        BigDecimal valor,
-        Instant gravadoEm) {
-}
-```
-
-### Passo 2 — O produtor (o gravador publica e esquece)
-
-Logo após persistir, o gravador publica o fato. A **chave** é o `id` do comprovante (ordenação por comprovante + boa distribuição):
-
-```java
-@Service
-public class GravadorService {
-
-    private final KafkaTemplate<String, ComprovanteGravadoEvent> kafkaTemplate;
-
-    public GravadorService(KafkaTemplate<String, ComprovanteGravadoEvent> kafkaTemplate) {
-        this.kafkaTemplate = kafkaTemplate;
-    }
-
-    public void gravar(Comprovante comprovante) {
-        repository.save(comprovante); // fonte da verdade persistida
-
-        var evento = new ComprovanteGravadoEvent(
-                comprovante.getId(),
-                comprovante.getChavePixDestino(),
-                comprovante.getValor(),
-                Instant.now());
-
-        // chave = id do comprovante → mesma partição, ordem preservada
-        kafkaTemplate.send("comprovante-gravado", comprovante.getId().toString(), evento);
+@RabbitListener(queues = "comprovante.gravar.q", ackMode = "MANUAL")
+public void aoReceber(GravarComprovanteCommand cmd, Channel canal,
+                      @Header(AmqpHeaders.DELIVERY_TAG) long tag) throws IOException {
+    try {
+        gravar(cmd);                 // processa
+        canal.basicAck(tag, false);  // confirma só após sucesso
+    } catch (FalhaTransitoria e) {
+        canal.basicNack(tag, false, true);  // requeue=true → tenta de novo
+    } catch (MensagemInvalida e) {
+        canal.basicNack(tag, false, false); // requeue=false → vai para a DLQ
     }
 }
 ```
 
-O gravador não conhece notificação, antifraude nem BI. Publica o fato e segue. Esse é o desacoplamento que queríamos.
+O `redelivery` é precisamente por que a **idempotência** da Aula 4 é obrigatória: a mesma mensagem **vai** chegar duas vezes em algum cenário de crash, e o consumidor tem que tratar a segunda chegada sem duplicar o comprovante. Ack manual e idempotência são as duas metades da entrega confiável.
 
-### Passo 3 — Três consumidores, três `groupId`
+> Na prática com Spring AMQP, em vez de manipular o `Channel` na mão, você costuma deixar o **container do listener** gerenciar o ack (`AUTO` mode, que faz ack após retorno sem exceção e nack na exceção) e configurar o comportamento de retry/dead-letter por **configuração** — código mais limpo e menos sujeito a erro. O exemplo manual acima existe para você ver o que acontece por baixo.
 
-Cada consumidor declara um **`groupId` diferente**. É isso que faz os três lerem **os mesmos eventos de forma independente**, cada um com seu offset:
+---
+
+## 4. Prefetch / QoS: quantas mensagens não-confirmadas por consumidor
+
+Se um consumidor puxa **todas** as mensagens da fila de uma vez para a memória local antes de processá-las, dois problemas surgem: ele pode estourar a própria memória, e o trabalho fica **desbalanceado** — um consumidor "engole" 10 mil mensagens enquanto outro fica ocioso.
+
+O **prefetch count** (configurado via `basic.qos`) limita **quantas mensagens não-confirmadas (in-flight)** o broker entrega a cada consumidor antes de receber o ack delas. É o controle de QoS (Quality of Service) do consumo.
+
+```java
+@Bean
+public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+        ConnectionFactory connectionFactory) {
+    var factory = new SimpleRabbitListenerContainerFactory();
+    factory.setConnectionFactory(connectionFactory);
+    factory.setPrefetchCount(10);   // no máx. 10 mensagens in-flight por consumidor
+    factory.setDefaultRequeueRejected(false); // exceção → dead-letter, não requeue infinito
+    return factory;
+}
+```
+
+A heurística de tuning:
+
+- **Prefetch baixo (1–10):** melhor **balanceamento** entre consumidores e menor risco de uma instância acumular trabalho que não vai dar conta. Ideal para tarefas pesadas e demoradas, como a gravação que depende do banco.
+- **Prefetch alto (centenas):** melhor **throughput** quando cada mensagem é leve e rápida, porque reduz o ida-e-volta de pedir mais mensagens. Pior balanceamento.
+
+Para a gravação do PIX (tarefa de IO, latência variável), um prefetch baixo é o ponto de partida sensato: você prefere que mensagens sobrem na fila (visíveis, escaláveis) a que sobrem acumuladas dentro de um consumidor (invisíveis, perdidas se ele cai). Prefetch também é uma das alavancas de **backpressure** da Aula 4: limitar o in-flight evita que o consumidor afogue o banco a jusante.
+
+---
+
+## 5. Retry com backoff: a resposta à falha transitória
+
+Para a falha **transitória**, a estratégia é tentar de novo — mas **não imediatamente nem para sempre**. Tentar de novo na mesma fração de segundo, contra um banco que acabou de cair, é um *retry storm*: você martela um recurso já sofrendo e prolonga o incidente (assunto da Aula 7).
+
+A combinação certa é **retry com backoff exponencial e limite**:
+
+- **Backoff exponencial:** espaça as tentativas crescentemente — 1 s, 2 s, 4 s, 8 s — dando ao recurso a jusante tempo para se recuperar.
+- **Limite de tentativas:** depois de N tentativas (ex.: 3 a 5), você **para**. Se ainda falha, ou o problema não era transitório, ou está durando demais para reprocessar in-line — em ambos os casos, a mensagem vai para a DLQ.
+
+Com Spring AMQP isso se configura declarativamente, sem poluir o listener:
+
+```java
+@Bean
+public RetryOperationsInterceptor retryInterceptor() {
+    return RetryInterceptorBuilder.stateless()
+            .maxAttempts(4)                                  // 1 original + 3 retries
+            .backOffOptions(1000, 2.0, 10000)               // 1s, 2s, 4s... teto 10s
+            .recoverer(new RejectAndDontRequeueRecoverer()) // esgotou → dead-letter
+            .build();
+}
+```
+
+O `RejectAndDontRequeueRecoverer` é a peça que liga o retry à DLQ: quando as tentativas se esgotam, ele faz `nack` com `requeue=false`, e **aí** o mecanismo de dead-lettering entra em ação. Sem ele, o default seria requeue infinito — o loop da poison message.
+
+---
+
+## 6. Dead Letter Queue: o destino da falha permanente
+
+A **Dead Letter Queue (DLQ)** é uma fila lateral para onde uma mensagem é desviada quando **não pode ser entregue/processada normalmente**. O ponto inegociável: a mensagem é **preservada para inspeção**, **nunca descartada em silêncio**. Uma mensagem que "some" sem rastro é um comprovante perdido e um bug invisível; a DLQ existe para que isso jamais aconteça por acidente.
+
+Uma mensagem é "dead-lettered" (enviada à DLQ) em três situações:
+
+1. O consumidor faz `nack`/`reject` com `requeue=false` (nosso caso de mensagem inválida ou retry esgotado).
+2. A mensagem **expira** (TTL estourado) sem ser consumida.
+3. A fila atinge o **limite de tamanho** (`max-length`) e descarta a mais antiga para a DLQ.
+
+O roteamento para a DLQ não é mágico: é o **mesmo** mecanismo de exchange/binding da seção 2. A fila principal declara, nos seus argumentos, uma **dead-letter-exchange** para onde mandar os mortos:
+
+```java
+@Bean
+public Queue gravacaoQueue() {
+    return QueueBuilder.durable("comprovante.gravar.q")
+            .withArgument("x-dead-letter-exchange", "comprovante.dlx")    // para onde mandar
+            .withArgument("x-dead-letter-routing-key", "comprovante.morto") // com que rótulo
+            .build();
+}
+
+@Bean
+public Queue dlq() {
+    return QueueBuilder.durable("comprovante.gravar.dlq").build(); // a fila dos mortos
+}
+
+@Bean
+public DirectExchange deadLetterExchange() {
+    return new DirectExchange("comprovante.dlx");
+}
+
+@Bean
+public Binding dlqBinding() {
+    return BindingBuilder.bind(dlq())
+            .to(deadLetterExchange())
+            .with("comprovante.morto"); // rota da DLX até a DLQ
+}
+```
+
+Os argumentos `x-dead-letter-*` são o contrato: `x-dead-letter-exchange` diz **para qual exchange** a mensagem morta vai, e `x-dead-letter-routing-key` (opcional) **reescreve a routing key** para que a DLX a entregue na DLQ certa. A mensagem chega na DLQ com **headers de diagnóstico** (`x-death`) que registram **quantas vezes** ela morreu, **de qual fila** e **por quê** — material de ouro para o time investigar o bug que a causou.
+
+> A DLQ não é uma lixeira; é uma **sala de necropsia**. Toda mensagem ali é um incidente a ser entendido: ou um bug de dados a corrigir, ou uma incompatibilidade de versão, ou um cenário que o código não previu. O fluxo operacional maduro inclui **alarmar quando a DLQ cresce** e, muitas vezes, um processo de **reprocessamento** após corrigir a causa.
+
+---
+
+## 7. Poison message e ordenação
+
+A **poison message (mensagem envenenada)** é a mensagem que **falha permanentemente** mas o sistema insiste em reprocessar. Sem retry limitado + DLQ, ela vira um loop infinito: o consumidor pega, falha, devolve à fila (requeue), pega de novo, falha de novo — consumindo CPU, gerando log infinito e, pior, **bloqueando** as mensagens boas atrás dela. Uma única mensagem malformada pode parar toda a gravação de comprovantes.
+
+A defesa é exatamente a arquitetura que montamos: **limite de tentativas** (a poison não fica eternamente) + **DLQ** (ela sai do caminho das mensagens boas, mas não se perde). É por isso que "retry sem limite" e "consumidor sem DLQ" são, juntos, a receita do desastre.
+
+Sobre **ordenação**: o RabbitMQ garante ordem **FIFO dentro de uma única fila com um único consumidor**. Assim que você adiciona **múltiplos consumidores** (para escalar) ou **retry/redelivery** (uma mensagem que falha e volta entra atrás das que chegaram depois), a ordem **deixa de ser garantida**. Para a gravação de comprovantes isso é aceitável — cada comprovante é independente, identificado pelo seu `id`, e a idempotência cuida das duplicatas. Mas é um trade-off a declarar: **se o seu domínio exige ordem estrita, escala horizontal e fila simples não convivem** — você precisaria de particionamento por chave (terreno do Kafka, próxima aula).
+
+---
+
+## 8. Exemplo trabalhado: provar a DLQ com uma mensagem envenenada
+
+Montar a topologia é metade do trabalho; **provar** que ela funciona é a outra. O objetivo: injetar uma mensagem que falha sempre e **demonstrar** que ela acaba na DLQ — sem travar a fila e sem se perder.
+
+O consumidor, que distingue os dois tipos de falha:
 
 ```java
 @Component
-public class NotificacaoListener {
+public class GravacaoListener {
 
-    @KafkaListener(topics = "comprovante-gravado", groupId = "notificacao")
-    public void aoGravar(ComprovanteGravadoEvent e) {
-        notificacaoService.avisarCliente(e.comprovanteId(), e.chavePixDestino());
+    private final ComprovanteRepository repositorio;
+
+    public GravacaoListener(ComprovanteRepository repositorio) {
+        this.repositorio = repositorio;
     }
-}
 
-@Component
-public class AntifraudeListener {
-
-    @KafkaListener(topics = "comprovante-gravado", groupId = "antifraude")
-    public void analisar(ComprovanteGravadoEvent e) {
-        antifraudeService.avaliarPadrao(e.comprovanteId(), e.valor());
-    }
-}
-
-@Component
-public class BiListener {
-
-    @KafkaListener(topics = "comprovante-gravado", groupId = "bi")
-    public void agregar(ComprovanteGravadoEvent e) {
-        metricaService.incrementarVolumetria(e.valor(), e.gravadoEm());
+    @RabbitListener(queues = "comprovante.gravar.q")
+    public void aoReceber(GravarComprovanteCommand cmd) {
+        if (cmd.valor() == null || cmd.idComprovante() == null) {
+            // falha PERMANENTE: nenhum retry vai consertar isto
+            throw new AmqpRejectAndDontRequeueException("comprovante malformado");
+        }
+        if (repositorio.existsById(cmd.idComprovante())) {
+            return; // idempotência sob redelivery
+        }
+        repositorio.save(mapear(cmd)); // pode lançar falha TRANSITÓRIA (banco) → retry
     }
 }
 ```
 
-### Passo 4 — Adicionar um quarto consumidor (sem tocar no produtor)
+A distinção está nos dois caminhos de exceção:
 
-Amanhã, compliance precisa reagir. A mudança é **um arquivo novo**, com um `groupId` novo. O gravador permanece intocado. E se compliance precisa ver os comprovantes gravados **antes de existir**, basta configurar o grupo para ler do início (`auto-offset-reset: earliest`) — o log retido entrega o passado:
+- `AmqpRejectAndDontRequeueException` sinaliza ao Spring AMQP "**não** tente de novo" → a mensagem vai **direto** para a DLQ. É a resposta à falha permanente, sem desperdiçar tentativas.
+- Qualquer outra exceção (ex.: `DataAccessException` do banco oscilando) passa pelo **retry com backoff** da seção 5; só vai para a DLQ se as 4 tentativas se esgotarem.
 
-```java
-@Component
-public class ComplianceListener {
+**O roteiro do experimento** (o que você fará no studio):
 
-    // groupId novo → começa do offset zero e "vê" toda a história já gravada
-    @KafkaListener(topics = "comprovante-gravado", groupId = "compliance")
-    public void registrar(ComprovanteGravadoEvent e) {
-        complianceService.arquivar(e);
-    }
-}
-```
+1. Publique um `GravarComprovanteCommand` **válido** → confirme que grava normalmente e dá ack.
+2. Publique um comando com `valor` nulo → observe que ele **não** fica em loop; vai **imediatamente** para `comprovante.gravar.dlq`.
+3. Abra a fila `comprovante.gravar.dlq` no **painel de management** do RabbitMQ → veja a mensagem **preservada**, com os headers `x-death` mostrando a origem e o motivo.
+4. Publique outro comando **válido** logo depois do envenenado → confirme que ele **passa na frente**: a poison message **não bloqueou** a fila.
 
-Esse é o ganho concreto da arquitetura orientada a eventos: **o sistema cresce por adição, não por modificação**. Cada nova reação é um consumidor novo, isolado, que não conhece e não afeta os outros.
+Os passos 2 e 4 juntos são a prova que importa: a falha permanente foi **isolada** (não travou) e **preservada** (não sumiu). Essa é a definição operacional de "mensagem nunca some por acidente — ou foi processada, ou está numa DLQ por decisão".
 
 ---
 
-## 8. Ponte com o legado Caixa
+## 9. Ponte com o legado Caixa
 
-Quem operou mainframe já fez isto sem o nome. O **"arquivo de movimento do dia"** — aquele arquivo sequencial que vários jobs noturnos liam, cada um fazendo sua parte (um atualizava saldo, outro gerava relatório, outro alimentava o data warehouse) — **já era um log de eventos**. Vários consumidores, o mesmo arquivo, ninguém apagava a parte do outro, e o produtor (o sistema online do dia) não sabia quem eram os jobs noturnos.
+Quem operou processamento **batch** no mainframe já conhece a DLQ por outro nome: a **"fila de exceção"**, o **"arquivo de rejeitados"**, o dataset de registros que o job não conseguiu processar e separou para tratamento posterior. O conceito é idêntico — não descartar o que falhou, separá-lo para análise — e a maturidade operacional de "todo dia alguém olha os rejeitados" é exatamente a cultura que a DLQ moderna exige.
 
-O que o Kafka muda **não é o conceito** — é o regime: aquele log era **batch** (uma vez por dia, arquivo fechado) e o Kafka é **streaming contínuo** (o fato fica disponível em milissegundos, não no fechamento do dia). O offset por consumer group é o equivalente moderno de cada job saber "até onde já processei o arquivo de hoje". Quem entende o ciclo de movimento do legado entende Kafka mais rápido que a média — é a mesma ideia, em tempo real e com durabilidade distribuída.
-
----
-
-## 9. IA & agentes hoje
-
-A arquitetura orientada a eventos virou a espinha dorsal de sistemas de IA sérios:
-
-- **Event-driven para agentes.** Em vez de um orquestrador chamar cada agente diretamente (recriando o acoplamento do gravador ingênuo), os agentes **reagem a eventos** num log. Um agente publica "documento processado"; agentes de resumo, classificação e indexação reagem, cada um no seu grupo. Adicionar um agente novo não toca nos existentes — exatamente o consumer group novo da seção 7.
-- **Event sourcing como memória do agente.** O log de eventos (cada ação, cada observação, cada decisão) é a **memória reproduzível** do agente. Dá auditoria ("por que o agente decidiu isto?") e **replay** (reexecutar a trajetória com um prompt corrigido), do mesmo jeito que reproduzimos o estado de um comprovante. Para um agente em produção financeira, essa trilha não é opcional.
-- **Streaming para ingestão e RAG.** Novos documentos entram como eventos num tópico; um consumidor calcula embeddings e **atualiza o índice vetorial continuamente**, sem reprocessar a base inteira. O índice vira uma projeção do log de documentos — a mesma ideia da seção 6, aplicada ao conhecimento do agente.
+O que mudou é que a DLQ hoje é **explícita, observável e instrumentada**: em vez de um arquivo perdido num diretório que alguém *talvez* abra, é uma fila com **métrica de profundidade**, **alarme** quando cresce, e **headers de diagnóstico** (`x-death`) que contam a história da falha. O retry com backoff, da mesma forma, é a versão observável do velho "tenta de novo no próximo ciclo do batch" — agora com política configurável e por mensagem, não por job inteiro. O veterano de batch entende essa aula mais rápido que ninguém: ele já viveu o que acontece quando um único registro envenenado derruba o processamento da madrugada inteira.
 
 ---
 
-## 10. Para ir além
+## 10. IA & agentes hoje
 
-- **Documentação Apache Kafka** — conceitos de tópico, partição, offset e consumer group (o ponto de partida canônico).
-- **Martin Kleppmann**, *Designing Data-Intensive Applications* — caps. sobre logs, streams e a dualidade tabela/log; a melhor explicação de event sourcing.
-- **Spring for Apache Kafka** — `KafkaTemplate`, `@KafkaListener` e configuração de consumer groups.
-- **Confluent** — padrões de event-driven architecture e *event sourcing* aplicado.
+A topologia de filas + DLQ é, hoje, infraestrutura padrão de pipelines de IA — pelas mesmas razões que no comprovante PIX, com o LLM no lugar do banco instável.
 
-> **Na próxima aula:** o tópico desacoplou os consumidores, mas criou um problema novo. O consumidor de notificação depende de um **gateway externo que oscila**. Quando ele cai e volta, o que acontece? Tentamos de novo — mas tentar de novo **sem piorar o incidente** é engenharia. Entram retry com backoff, idempotência e circuit breaker.
+- **Work queue para jobs de IA com rate limit:** vários workers consomem chamadas de LLM em paralelo, e a **fila vira o regulador de vazão**. O provedor de modelo impõe um limite de requisições por minuto; controlar o **prefetch** e o número de workers é como você respeita esse limite sem estourar `429` — a fila absorve o excesso em vez de rejeitá-lo.
+- **Backpressure quando o LLM é o gargalo:** quando a inferência é mais lenta que a chegada de tarefas, a fila cresce. Esse é o **sinal de saúde** mais direto: profundidade subindo = escalar workers ou throttlar a entrada, exatamente como na gravação do PIX. Monitorar a fila do agente é monitorar o agente.
+- **DLQ para chamadas de IA que falham:** um timeout, um conteúdo recusado pelo provedor, uma resposta que não casa com o schema esperado — são as *poison messages* do mundo de IA. Em vez de reprocessar para sempre (queimando dinheiro a cada tentativa contra um LLM) ou descartar em silêncio (perdendo a tarefa do usuário), a chamada falha vai para uma **DLQ** e entra em **inspeção humana**. A distinção transitório × permanente é a mesma: um `503` momentâneo do provedor merece retry com backoff; um prompt que sempre viola a política de conteúdo é falha permanente que precisa de gente olhando.
+
+Tudo o que você configurou aqui — exchange, binding, ack manual, prefetch, retry com backoff, DLQ — é transferível, sem adaptação conceitual, para orquestrar agentes em produção.
+
+---
+
+## 11. Para ir além
+
+- **RabbitMQ Tutorials** — especialmente *Work Queues*, *Routing*, *Topics* e *Dead Letter Exchanges* (a documentação oficial, com exemplos executáveis).
+- **Spring AMQP Reference** — *Message Listener Container*, *Retry*, *Dead Letter* e configuração de `x-dead-letter-*` por `QueueBuilder`.
+- **Gregor Hohpe & Bobby Woolf**, *Enterprise Integration Patterns* — *Dead Letter Channel* e *Invalid Message Channel* (os padrões que a DLQ implementa).
+- **RabbitMQ in Depth** (Gavin M. Roy) — para entender o protocolo AMQP por baixo das abstrações do Spring.
+
+> **Na próxima aula:** a fila de gravação resolve **um comando para um destino**. Mas o event storming da Aula 1 deixou uma política em aberto: *"sempre que um comprovante é gravado, notificar o cliente, avisar o antifraude e alimentar o BI"*. São **três** interessados no **mesmo** fato, e o gravador não deve nem saber que eles existem. Filas ponto-a-ponto não modelam isso bem — é a entrada de **tópicos e publish/subscribe**, e de um broker pensado para fan-out e replay em escala: o **Kafka**.

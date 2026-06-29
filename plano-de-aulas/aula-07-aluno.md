@@ -1,238 +1,247 @@
-# Material do Aluno — Aula 7: Resiliência — retry, circuit breaker e `@RetryableTopic`
+# Material do Aluno — Aula 7: Tópicos / eventos com Kafka
 
-> **Tempo de leitura:** ~13 min. Esta aula é sobre uma verdade desconfortável: num sistema distribuído, **as falhas não são exceção, são rotina**. A rede oscila, dependências ficam lentas, serviços externos retornam 503 sem aviso. A pergunta não é "como evito falhas?" — é "como o meu sistema **falha de propósito**, de um jeito controlado, antes que decida por você do pior jeito?". Leia com cuidado a seção de idempotência: ela é a pré-condição de tudo o que vem depois. Retry sem idempotência não é resiliência, é duplicação de efeito.
-
----
-
-## 1. O problema: reentregar sem afundar o navio
-
-No nosso projeto-guia, o consumidor de **notificação** lê o tópico `comprovante-gravado` (Aula 6) e, para cada evento, chama um **gateway externo** de notificação (SMS/push). Esse gateway é de terceiro e **oscila**: às vezes responde em 80 ms, às vezes timeout, às vezes retorna 503 por dois minutos durante uma instabilidade.
-
-Queremos três coisas ao mesmo tempo, e elas tensionam entre si:
-
-1. **Reentregar** quando o gateway se recupera (não perder a notificação por uma falha passageira).
-2. **Parar de tentar** quando ele claramente caiu (não martelar uma dependência morta).
-3. **Não inundá-lo** com retentativas que só aprofundam o buraco.
-
-O instinto do júnior é envolver a chamada num `try/catch` e tentar de novo num loop. Isso resolve o caso 1 e **piora** os casos 2 e 3 — é a receita do incidente. Resiliência é decidir, **de antemão e explicitamente**, como o sistema se comporta sob falha. As próximas seções são esse repertório de decisões.
+> **Tempo de leitura:** ~12 min. Esta aula muda o eixo do módulo: até aqui você mandava trabalho para ser feito (fila, comando, alguém consome **uma vez**). Agora você vai **publicar fatos** que muitos podem ler, no seu ritmo, inclusive no futuro. Essa distinção — trabalho × fato — é a diferença entre uma fila e um tópico, e ela reorganiza toda a arquitetura. Leia com atenção a seção da chave de partição: é o detalhe que mais derruba sistemas Kafka em produção.
 
 ---
 
-## 2. As falácias da computação distribuída
+## 1. O problema: vários querem reagir ao mesmo fato
 
-Em 1994, Peter Deutsch e colegas da Sun catalogaram as **falsas suposições** que todo desenvolvedor faz ao construir sistemas distribuídos — e que cobram caro em produção. Vale conhecê-las pelo nome, porque cada padrão desta aula existe para **contrariar uma delas**:
+No nosso projeto-guia, o `comprovante-gravador` acabou de persistir um comprovante PIX. Esse fato — "comprovante gravado" — interessa a várias áreas:
 
-1. **A rede é confiável.** É a falácia-mãe. A rede cai, perde pacotes, particiona. → exige **retry**.
-2. **A latência é zero.** Chamar um serviço remoto não é como chamar um método local; leva tempo, e esse tempo varia. → exige **timeout**.
-3. **A banda é infinita.** Mandar muito dado satura. → exige **rate limiting** e backpressure.
-4. **A rede é segura.** Nunca é. → exige autenticação, criptografia.
-5. **A topologia não muda.** Instâncias sobem e descem o tempo todo (lembre do rebalance da Aula 6). → exige descoberta de serviço, idempotência.
-6. **Há um único administrador.** Dependências de terceiros (o gateway de notificação, uma API de LLM) mudam sem te avisar. → exige **circuit breaker** e **fallback**.
-7. **O custo de transporte é zero.** Serialização, rede e infra têm custo. → exige eficiência.
-8. **A rede é homogênea.** Protocolos, versões e comportamentos divergem.
+- **Notificação** quer avisar o cliente ("seu comprovante está disponível").
+- **Antifraude** quer analisar o padrão da transação.
+- **BI** quer somar a métrica para o dashboard de volumetria.
 
-O fio condutor: **assumir que tudo dá certo é um bug de design.** O código resiliente assume que a chamada remota **vai falhar** e decide o que fazer quando falhar.
+A solução ingênua é o gravador chamar os três: `notificacaoClient.enviar(...)`, `antifraudeClient.analisar(...)`, `biClient.registrar(...)`. Funciona até a primeira mudança. Amanhã entra uma quarta área (compliance), depois uma quinta (data lake). Cada nova reação obriga a **mexer no gravador** e a **subir o gravador de novo**. Pior: se a antifraude está fora do ar, a chamada síncrona dela pode travar a gravação — uma área secundária derrubando o coração do sistema.
 
----
+O gravador virou um **ponto de acoplamento que cresce sem parar**. Ele conhece todos os interessados, depende da disponibilidade de todos e carrega a responsabilidade de orquestrar todos. Isso é exatamente o oposto do que o DDD da Aula 1 nos ensinou: o emissor de um fato **não deveria conhecer** quem reage a ele.
 
-## 3. Retry: o veneno e o antídoto (retry storm)
-
-Retry é a resposta natural à falácia "a rede é confiável": se uma falha pode ser transitória, tente de novo. Mas o retry **ingênuo** — tentar de novo imediatamente, em loop, sem limite — é uma das formas mais rápidas de transformar uma instabilidade pequena num apagão.
-
-O mecanismo do desastre é o **retry storm** (tempestade de retentativas). Imagine que o gateway fica lento por sobrecarga. Mil consumidores recebem timeout **ao mesmo tempo** e, todos juntos, tentam de novo **imediatamente**. O gateway, que estava só sobrecarregado, agora recebe o **dobro** de tráfego no mesmo instante e morre de vez. Quando volta a respirar, os mil clientes tentam de novo, sincronizados, e o derrubam outra vez. O retry, que deveria ajudar, virou um **ataque de negação de serviço involuntário** contra a própria dependência.
-
-Os três antídotos formam a base de qualquer política de retry decente:
-
-- **Backoff exponencial.** Espace as tentativas de forma crescente: 1s, 2s, 4s, 8s. Dá tempo de a dependência se recuperar em vez de ser martelada.
-- **Jitter (aleatoriedade).** Backoff sozinho não basta: se mil clientes falham juntos, eles ainda tentam de novo **juntos** em 1s, depois juntos em 2s — a sincronia persiste. O jitter soma uma aleatoriedade ao intervalo para **espalhar** as retentativas no tempo. Tipos comuns: *full jitter* (intervalo aleatório entre 0 e o backoff calculado — máximo espalhamento), *equal jitter* (metade fixa + metade aleatória) e *decorrelated jitter* (o próximo intervalo deriva aleatoriamente do anterior). Na prática, **full jitter** costuma ser a escolha mais simples e eficaz.
-- **Limite de tentativas.** Nunca tente para sempre. Depois do teto (digamos, 4 tentativas), a mensagem vai para a **DLT/DLQ** (Aula 5) para análise humana. Insistir infinitamente é desperdiçar recurso e mascarar uma falha real.
-
-> A diferença entre 1, 2, 4, 8 segundos **com jitter** e 0, 0, 0, 0 segundos **sem limite** é a diferença entre um sistema que se recupera sozinho e um que entra em colapso. Retry é necessário; retry **disciplinado** é o que separa engenharia de gambiarra.
+A inversão que resolve: em vez de o gravador **chamar** os interessados, ele **publica um fato** num lugar central — "comprovante gravado, aqui estão os dados" — e **quem se interessa que escute**. O gravador não sabe (e não quer saber) quantos consumidores existem. Adicionar um novo consumidor passa a ser uma operação que **não toca no produtor**. Esse "lugar central onde fatos são publicados e muitos leem" é um **tópico**.
 
 ---
 
-## 4. Idempotência: a pré-condição de qualquer retry
+## 2. Fila × tópico: a diferença que muda a arquitetura
 
-Aqui está a regra que não pode ser negociada: **você só pode tentar de novo com segurança se a operação for idempotente.** Uma operação é **idempotente** quando executá-la N vezes tem o **mesmo efeito** que executá-la uma vez.
+Esta é a distinção mais importante da aula. Fila e tópico parecem a mesma coisa — "lugar onde mensagens passam" — mas resolvem problemas opostos.
 
-Por que isso é vital? Considere o pior cenário do retry: o consumidor de notificação chama o gateway, o gateway **processa e envia o SMS**, mas a **resposta se perde** na rede (timeout do lado do cliente). O consumidor acha que falhou e **tenta de novo**. Sem proteção, o cliente recebe **dois SMS**. Em outro domínio — "debitar R$ 100" — o retry de uma resposta perdida debitaria **R$ 200**. O retry, que existe para não perder a operação, acabou **duplicando** o efeito.
-
-A defesa é tornar a operação idempotente, tipicamente com uma **chave de idempotência** — um identificador único da operação que o receptor usa para detectar repetição:
-
-```java
-@Service
-public class NotificacaoService {
-
-    private final NotificacaoRepository repository;
-    private final GatewayCliente gateway;
-
-    public void avisar(ComprovanteGravadoEvent e) {
-        // chave natural: o id do comprovante. Já notificado? não repete.
-        if (repository.jaNotificado(e.comprovanteId())) {
-            return; // idempotente: segunda execução não tem efeito adicional
-        }
-        gateway.enviar(e.chavePixDestino(), e.comprovanteId());
-        repository.marcarNotificado(e.comprovanteId());
-    }
-}
-```
-
-No nosso domínio, o `comprovanteId` é a chave natural — ele identifica unicamente o fato. Repare como tudo se conecta: na Aula 6 escolhemos o `id` do comprovante como **chave de partição** (ordem) e agora ele é também a **chave de idempotência** (deduplicação). O Kafka entrega *at-least-once* por padrão (pode reentregar no rebalance), então **idempotência no consumidor não é opcional** — é o que torna o "pelo menos uma vez" seguro.
-
----
-
-## 5. Circuit breaker: falhar rápido para se proteger
-
-Retry resolve falhas **transitórias** (um soluço de 200 ms). Mas e quando a dependência caiu **de verdade** e vai ficar fora por minutos? Continuar tentando — mesmo com backoff — desperdiça threads, enche timeouts e pode **propagar a falha em cascata** para o seu próprio serviço. A defesa é o **circuit breaker** (disjuntor), inspirado no disjuntor elétrico: quando a corrente está perigosa, ele **abre** e corta o circuito antes que a casa pegue fogo.
-
-O circuit breaker monitora a taxa de falha das chamadas a uma dependência e transita entre três estados:
-
-| Estado | Comportamento | Transição |
+| | **Fila** (ex.: RabbitMQ) | **Tópico** (ex.: Kafka) |
 |---|---|---|
-| **Closed** | Tudo normal; chamadas passam. Falhas são contabilizadas numa janela. | Se a taxa de falha estoura o limiar → **Open** |
-| **Open** | Circuito aberto: chamadas **falham na hora** (sem nem tentar a dependência). Poupa você e dá fôlego à dependência doente. | Após `wait-duration` → **Half-Open** |
-| **Half-Open** | Deixa passar **algumas** chamadas de teste. | Se voltam OK → **Closed**; se falham → **Open** de novo |
+| A mensagem é... | **trabalho** a ser feito | **fato** que aconteceu |
+| Consumida por... | **um** worker (entre vários concorrentes) | **vários** consumidores independentes |
+| Depois de processada | **some** (ack remove da fila) | **permanece** no log (retenção) |
+| Semântica | "faça isto" (comando) | "isto aconteceu" (evento) |
+| Quem conhece quem | produtor sabe que há trabalho a distribuir | produtor **ignora** quem consome |
+| Reprocessar o passado | impossível (já sumiu) | possível (**replay**) |
 
-O conceito contraintuitivo é **"falhar rápido"**. Quando o circuito está aberto, sua chamada falha **imediatamente** em vez de esperar um timeout de 30 segundos. Isso parece pior ("nem tentei!"), mas é o que **evita esgotar o pool de threads**: 1.000 requisições presas esperando timeout de uma dependência morta congelam o serviço inteiro e derrubam **funcionalidades que nada têm a ver** com o gateway. Falhar rápido contém o dano. Os parâmetros que você configura:
+Na **fila**, a mensagem é uma tarefa. Vários workers competem por ela, mas **apenas um** a pega — distribuir carga é o objetivo. Quando o worker confirma (ack), a mensagem desaparece. Foi exatamente o que usamos nas Aulas 4 e 5: "grave este comprovante" é um **comando**, um trabalho, consumido uma vez pelo gravador.
 
-- **Sliding window** — a janela (por contagem ou por tempo) sobre a qual a taxa de falha é medida.
-- **Failure rate threshold** — o percentual de falhas que dispara a abertura (ex.: 50%).
-- **Wait duration in open state** — quanto tempo fica aberto antes de testar (Half-Open).
+No **tópico**, a mensagem é um fato registrado num **log**. Ela não é endereçada a ninguém; fica disponível. **Cada** consumidor interessado lê o log inteiro, no seu ritmo, mantendo seu próprio progresso. Notificação, antifraude e BI leem **os mesmos eventos**, de forma independente, sem disputar entre si e sem que um afete o outro.
+
+> Não existe "Kafka é melhor que RabbitMQ". São ferramentas para problemas diferentes. **Regra prática:** se a frase natural é um verbo no imperativo ("grave o comprovante"), é **comando → fila**. Se é um fato no passado ("comprovante foi gravado"), é **evento → tópico**. Repare que essa é a mesma distinção comando/evento do event storming da Aula 1 — o desenho do domínio já apontava onde usar cada um.
+
+---
+
+## 3. O modelo mental do Kafka
+
+Kafka não é uma "fila com superpoderes". É um **log distribuído, append-only**. Entender cinco peças destrava tudo o mais.
+
+**Log append-only.** Um tópico é, na essência, um arquivo onde eventos só são **acrescentados ao fim**, nunca alterados nem removidos no meio. Cada evento ganha uma posição sequencial. Esse "só anexa" é o que torna o Kafka rápido (escrita sequencial em disco) e o que viabiliza o replay.
+
+**Partição.** Um tópico é dividido em **partições**, que são logs paralelos. Partição é a **unidade de paralelismo** (cada partição pode ser lida por uma instância diferente) **e a unidade de ordenação** (a ordem só é garantida *dentro* de uma partição). Um tópico `comprovante-gravado` com 6 partições aceita até 6 consumidores de um grupo lendo em paralelo.
+
+**Offset.** É a posição de leitura dentro de uma partição — um número que avança. O ponto crucial: **o offset pertence ao consumer group, não ao tópico**. O grupo `notificacao` está no offset 1.020 enquanto o grupo `bi` está no offset 340; cada um avança no seu ritmo, lendo os mesmos eventos. É por isso que múltiplos consumidores não interferem entre si.
+
+**Consumer group.** Um conjunto de instâncias que **dividem** as partições de um tópico entre si. Dentro de um grupo, cada partição é lida por **uma só** instância — é assim que o Kafka escala o consumo. Entre grupos diferentes, **cada grupo lê tudo**. Ou seja: dentro do grupo = distribuição de carga (como fila); entre grupos = broadcast (como tópico). Os dois comportamentos no mesmo mecanismo.
+
+**Replicação.** Cada partição é copiada em vários brokers (réplicas). Se o broker líder de uma partição cai, uma réplica assume. É o que dá a durabilidade que justifica usar o log como fonte da verdade.
+
+```
+Tópico "comprovante-gravado", 3 partições:
+
+P0: [e0][e3][e6][e9]  ← append-only, offsets crescentes
+P1: [e1][e4][e7]
+P2: [e2][e5][e8][e10]
+
+Grupo "notificacao" (2 instâncias):  inst-A lê P0,P1 | inst-B lê P2
+Grupo "bi" (1 instância):            inst-C lê P0,P1,P2
+→ cada grupo tem seu próprio offset em cada partição
+```
+
+---
+
+## 4. A chave de partição: ordenação e o perigo da partição quente
+
+A pergunta que decide a qualidade do seu design: **em qual partição um evento cai?** A resposta vem da **chave** da mensagem. O Kafka calcula `hash(chave) % número_de_partições`. Consequências diretas:
+
+- **Mesma chave → mesma partição → ordem garantida** entre esses eventos.
+- **Chaves diferentes → partições possivelmente diferentes → sem garantia de ordem** entre elas.
+- **Chave nula → distribuição round-robin** (espalha, mas perde qualquer agrupamento por ordem).
+
+No nosso domínio, a chave natural do tópico `comprovante-gravado` é o **`id` do comprovante**. Assim, todos os eventos de um mesmo comprovante (gravado, depois corrigido, depois reemitido) caem na mesma partição e são lidos **na ordem em que aconteceram**. Isso importa: notificar "comprovante corrigido" antes de "comprovante gravado" seria um bug.
+
+Mas a escolha da chave tem duas armadilhas clássicas:
+
+**Quebrar a ordem.** Se você precisa de ordem por comprovante mas usa o `id` do *cliente* como chave, dois comprovantes do mesmo cliente caem juntos — talvez não seja o que você quer. Pior: se não usa chave nenhuma onde a ordem importa, dois eventos do mesmo comprovante podem ir para partições diferentes e ser processados fora de ordem. **Ordem no Kafka é por partição, e partição é decidida pela chave.** Não há ordem global "de graça".
+
+**Partição quente (hot partition).** Se a chave tem **baixa cardinalidade** ou é **enviesada**, uma partição recebe a maioria das mensagens. Exemplo perigoso: usar o `tipoChave` do PIX (CPF, e-mail, telefone, aleatória — só 4 valores) como chave do tópico. Com 6 partições, no máximo 4 são usadas, e se 80% dos PIX são por CPF, **uma partição recebe 80% da carga**. Aquele consumidor satura enquanto os outros ficam ociosos — você comprou paralelismo e não pode usá-lo. Boa chave de partição tem **alta cardinalidade e distribuição equilibrada**; o `id` (UUID) do comprovante é ideal.
+
+> Resumo que vale ouro numa banca: **a chave controla simultaneamente a ordenação e o balanceamento.** Escolha pensando em "o que precisa ser lido em ordem" e "o que distribui bem". Quando esses dois objetivos brigam, é sinal de que o modelo de eventos precisa de revisão.
+
+---
+
+## 5. Retenção e replay
+
+Numa fila, a mensagem some quando é processada. No Kafka, **o evento permanece no log** por um período configurado (`retention.ms`) — dias, semanas, ou até "para sempre" em tópicos compactados. Consumir **não apaga**. Essa propriedade aparentemente simples destrava capacidades que a fila não tem.
+
+**Replay.** Você pode **reposicionar o offset** de um consumer group para trás e reprocessar eventos já lidos. Cenários reais:
+
+- A notificação tinha um bug que formatava a mensagem errada por 3 dias. Você corrige o código e **reprocessa os últimos 3 dias** — os eventos ainda estão lá.
+- O índice do BI corrompeu. Você reconstrói reprocessando o log desde o início, sem precisar de backup separado: **o log é o backup**.
+
+**Plugar um consumidor novo no passado.** Quando uma nova área (compliance) precisa reagir a comprovantes gravados, ela sobe um consumer group novo e começa a ler **do offset zero**. Ela "vê" toda a história que aconteceu **antes de existir**, sem que ninguém precise reenviar nada e sem afetar os consumidores existentes (cada grupo tem seu offset). Numa fila isso seria impossível: o passado já foi consumido e descartado.
+
+---
+
+## 6. Event sourcing: o log como fonte da verdade
+
+Quando você leva a ideia do log retido até o fim, chega ao **event sourcing**: em vez de guardar apenas o **estado atual** ("comprovante está GRAVADO"), você guarda a **sequência de fatos** que levou a ele ("emitido", "aceito", "gravado", "consultado"). O estado atual passa a ser uma **projeção** — algo que você **calcula** reproduzindo os eventos, não algo que você armazena como verdade primária.
+
+Por que isso é poderoso:
+
+- **Auditoria nativa.** O log *é* a trilha de auditoria. Para um sistema financeiro como o da Caixa, poder responder "por que este comprovante está neste estado?" reproduzindo cada fato é um requisito, não um luxo.
+- **Reconstrução de estado.** Se a base de leitura corrompe ou você precisa de uma nova visão dos dados, reproduz os eventos e reconstrói. O passado é reproduzível.
+- **Múltiplas projeções do mesmo log.** Notificação, antifraude e BI são, cada um, uma **projeção diferente** do mesmo fluxo de eventos. Uma nova pergunta de negócio vira uma nova projeção — sem migração de schema.
+
+Event sourcing tem custo (complexidade, versionamento de eventos, *snapshots* para não reproduzir milhões de eventos toda vez) e nem todo sistema precisa dele. Mas o **modelo mental** — "o fato é a verdade, o estado é derivado" — é o que torna o Kafka mais que um cano de mensagens.
+
+> **Rebalance (em uma frase):** quando uma instância de um consumer group entra ou sai, o Kafka **redistribui as partições** entre as instâncias restantes (rebalance). Durante esse rearranjo o consumo pausa brevemente; por isso processamento idempotente importa — uma partição pode ser reprocessada a partir do último offset confirmado. Voltaremos à idempotência na próxima aula.
+
+---
+
+## 7. Exemplo trabalhado: `comprovante-gravado` com três consumer groups
+
+Vamos do produtor aos três consumidores independentes, no nosso domínio.
+
+### Passo 1 — O evento (um fato, imutável)
+
+Um evento de domínio descreve algo que **já aconteceu**. Nome no passado, dados completos para quem reage não precisar voltar perguntar:
 
 ```java
-// application.yml (Resilience4j)
-//
-// resilience4j:
-//   circuitbreaker:
-//     instances:
-//       gatewayNotificacao:
-//         sliding-window-type: COUNT_BASED
-//         sliding-window-size: 10
-//         failure-rate-threshold: 50          # 50% de falhas → abre
-//         wait-duration-in-open-state: 30s     # 30s aberto, depois half-open
-//         permitted-number-of-calls-in-half-open-state: 3
+public record ComprovanteGravadoEvent(
+        UUID comprovanteId,
+        String chavePixDestino,
+        BigDecimal valor,
+        Instant gravadoEm) {
+}
+```
 
+### Passo 2 — O produtor (o gravador publica e esquece)
+
+Logo após persistir, o gravador publica o fato. A **chave** é o `id` do comprovante (ordenação por comprovante + boa distribuição):
+
+```java
 @Service
-public class GatewayCliente {
+public class GravadorService {
 
-    @CircuitBreaker(name = "gatewayNotificacao", fallbackMethod = "fallback")
-    public void enviar(String destino, UUID comprovanteId) {
-        gatewayHttp.post(destino, comprovanteId); // pode estourar timeout / 503
+    private final KafkaTemplate<String, ComprovanteGravadoEvent> kafkaTemplate;
+
+    public GravadorService(KafkaTemplate<String, ComprovanteGravadoEvent> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
     }
 
-    // chamado quando o circuito está aberto OU a chamada falha
-    private void fallback(String destino, UUID comprovanteId, Throwable t) {
-        log.warn("Gateway indisponível ({}). Enfileirando para reenvio: {}", t.getMessage(), comprovanteId);
-        reenvioRepository.agendar(comprovanteId); // degrada com elegância, não derruba
+    public void gravar(Comprovante comprovante) {
+        repository.save(comprovante); // fonte da verdade persistida
+
+        var evento = new ComprovanteGravadoEvent(
+                comprovante.getId(),
+                comprovante.getChavePixDestino(),
+                comprovante.getValor(),
+                Instant.now());
+
+        // chave = id do comprovante → mesma partição, ordem preservada
+        kafkaTemplate.send("comprovante-gravado", comprovante.getId().toString(), evento);
     }
 }
 ```
 
-O **fallback** é o par natural do breaker: quando o circuito abre, em vez de explodir, você executa um plano B (enfileirar para depois, retornar uma resposta degradada, usar cache). Falhar de propósito **com** um plano B é o auge da resiliência.
+O gravador não conhece notificação, antifraude nem BI. Publica o fato e segue. Esse é o desacoplamento que queríamos.
 
----
+### Passo 3 — Três consumidores, três `groupId`
 
-## 6. Timeout, bulkhead e rate limiting
-
-O circuit breaker não vem sozinho. Três padrões completam o kit, cada um atacando uma falácia da seção 2.
-
-**Timeout.** Contraria "a latência é zero". **Toda** chamada remota precisa de um teto de tempo. Sem timeout, uma dependência que ficou lenta (não caiu — só lenta) prende suas threads indefinidamente, e o efeito é idêntico ao de uma queda total. Regra: **nunca espere para sempre.** O timeout é também o que **alimenta** o circuit breaker — uma chamada que estoura o timeout conta como falha na janela.
-
-**Bulkhead (anteparo).** O nome vem dos compartimentos estanques de um navio: se um enche d'água, os anteparos impedem que afunde o casco inteiro. Em software, é **isolar pools de recursos por dependência**. Se as chamadas ao gateway de notificação têm seu próprio pool de threads, uma lentidão lá esgota **só aquele pool** — as chamadas à antifraude, que usam outro pool, continuam normais. Sem bulkhead, uma dependência doente consome **todas** as threads do serviço e derruba tudo junto.
-
-```java
-@Bulkhead(name = "gatewayNotificacao", type = Bulkhead.Type.THREADPOOL)
-@CircuitBreaker(name = "gatewayNotificacao", fallbackMethod = "fallback")
-public void enviar(String destino, UUID comprovanteId) {
-    gatewayHttp.post(destino, comprovanteId);
-}
-```
-
-**Rate limiting (brevemente).** Contraria "a banda é infinita". Limita **quantas** chamadas você faz por unidade de tempo a uma dependência. Útil quando o terceiro impõe cota (o gateway aceita 100 req/s) ou quando você quer proteger uma dependência frágil de picos. No Resilience4j é o `@RateLimiter`; conceitualmente, é você **se autolimitando** antes que a dependência te puna com 429.
-
----
-
-## 7. `@RetryableTopic`: retry e DLT no Spring Kafka
-
-Os padrões acima valem para chamadas síncronas. Mas o consumidor de notificação é **orientado a eventos** — ele lê o tópico Kafka. Aqui há um problema específico: se uma mensagem falha e você fica tentando **dentro** do listener, você **trava o consumo** da partição inteira (lembre: ordem por partição, Aula 6). Uma mensagem problemática bloqueia todas as seguintes — *head-of-line blocking*.
-
-O Spring Kafka resolve isso com `@RetryableTopic`, que implementa retry **não-bloqueante** usando **tópicos auxiliares**. A mensagem que falha não é reprocessada em loop no mesmo lugar; ela é **republicada** num tópico de retry com delay, liberando a partição principal:
+Cada consumidor declara um **`groupId` diferente**. É isso que faz os três lerem **os mesmos eventos de forma independente**, cada um com seu offset:
 
 ```java
 @Component
 public class NotificacaoListener {
 
-    private final NotificacaoService notificacaoService;
-
-    @RetryableTopic(
-            attempts = "4",                                  // 1 original + 3 retries
-            backoff = @Backoff(delay = 1000, multiplier = 2.0), // 1s, 2s, 4s
-            dltStrategy = DltStrategy.FAIL_ON_ERROR)          // esgotou → DLT
     @KafkaListener(topics = "comprovante-gravado", groupId = "notificacao")
     public void aoGravar(ComprovanteGravadoEvent e) {
-        notificacaoService.avisar(e); // idempotente (seção 4) → retry seguro
+        notificacaoService.avisarCliente(e.comprovanteId(), e.chavePixDestino());
     }
+}
 
-    @DltHandler
-    public void tratarDlt(ComprovanteGravadoEvent e) {
-        // teto de tentativas atingido: parar e pedir olhar humano
-        alertaService.notificarFalhaPermanente(e.comprovanteId());
+@Component
+public class AntifraudeListener {
+
+    @KafkaListener(topics = "comprovante-gravado", groupId = "antifraude")
+    public void analisar(ComprovanteGravadoEvent e) {
+        antifraudeService.avaliarPadrao(e.comprovanteId(), e.valor());
+    }
+}
+
+@Component
+public class BiListener {
+
+    @KafkaListener(topics = "comprovante-gravado", groupId = "bi")
+    public void agregar(ComprovanteGravadoEvent e) {
+        metricaService.incrementarVolumetria(e.valor(), e.gravadoEm());
     }
 }
 ```
 
-O que o Spring cria automaticamente nos bastidores:
+### Passo 4 — Adicionar um quarto consumidor (sem tocar no produtor)
 
+Amanhã, compliance precisa reagir. A mudança é **um arquivo novo**, com um `groupId` novo. O gravador permanece intocado. E se compliance precisa ver os comprovantes gravados **antes de existir**, basta configurar o grupo para ler do início (`auto-offset-reset: earliest`) — o log retido entrega o passado:
+
+```java
+@Component
+public class ComplianceListener {
+
+    // groupId novo → começa do offset zero e "vê" toda a história já gravada
+    @KafkaListener(topics = "comprovante-gravado", groupId = "compliance")
+    public void registrar(ComprovanteGravadoEvent e) {
+        complianceService.arquivar(e);
+    }
+}
 ```
-comprovante-gravado            (principal)
-comprovante-gravado-retry-0    (delay 1s)
-comprovante-gravado-retry-1    (delay 2s)
-comprovante-gravado-retry-2    (delay 4s)
-comprovante-gravado-dlt        (dead-letter topic: parou aqui)
-```
 
-A mensagem desce essa escada de retry com backoff exponencial; se todas as tentativas falham, cai na **DLT** — o "fim da linha" onde a equipe investiga sem perder o evento. Repare como `@RetryableTopic` (retry no nível da entrega da mensagem) e `@CircuitBreaker` (proteção da chamada externa dentro do `avisar`) **se compõem**: o breaker evita que cada tentativa de retry martele um gateway morto, e o retry garante que falhas transitórias não percam a notificação. E nada disso é seguro sem a **idempotência** da seção 4 — porque retry, por definição, reexecuta.
+Esse é o ganho concreto da arquitetura orientada a eventos: **o sistema cresce por adição, não por modificação**. Cada nova reação é um consumidor novo, isolado, que não conhece e não afeta os outros.
 
 ---
 
-## 8. Exemplo trabalhado: o caminho completo de uma notificação
+## 8. Ponte com o legado Caixa
 
-Juntando as peças, vamos seguir um evento `comprovante-gravado` em três cenários.
+Quem operou mainframe já fez isto sem o nome. O **"arquivo de movimento do dia"** — aquele arquivo sequencial que vários jobs noturnos liam, cada um fazendo sua parte (um atualizava saldo, outro gerava relatório, outro alimentava o data warehouse) — **já era um log de eventos**. Vários consumidores, o mesmo arquivo, ninguém apagava a parte do outro, e o produtor (o sistema online do dia) não sabia quem eram os jobs noturnos.
 
-**Cenário A — gateway saudável.** O listener recebe o evento, `avisar` verifica que não foi notificado, o circuit breaker está *closed*, o gateway responde OK, marca como notificado. Uma execução, um SMS.
-
-**Cenário B — falha transitória (gateway soluça).** Timeout na primeira tentativa. `@RetryableTopic` republica no `retry-0` com 1s de delay; na segunda, o gateway respondeu OK. A idempotência garante que, se o SMS tinha sido enviado mas a resposta se perdeu, o `jaNotificado` impede o segundo envio. Notificação entregue, **sem duplicação**, sem travar a partição.
-
-**Cenário C — falha permanente (gateway fora há minutos).** As primeiras falhas enchem a sliding window; ao cruzar 50%, o **circuit breaker abre**. Cada tentativa passa a **falhar na hora** (sem esperar timeout) e cai no `fallback`, que **enfileira para reenvio** em vez de explodir. Esgotadas as 4 tentativas, a mensagem vai para a **DLT** e o `@DltHandler` dispara um alerta. O serviço **continua de pé**, sem esgotar threads e sem derrubar antifraude e BI (isolados por bulkhead + consumer groups separados). Quando o gateway volta, o breaker passa a *half-open*, testa, fecha, e o reenvio é drenado.
-
-Os três cenários com a **mesma** configuração. Isso é "decidir como falhar de propósito": o comportamento sob falha não é improviso — está desenhado.
+O que o Kafka muda **não é o conceito** — é o regime: aquele log era **batch** (uma vez por dia, arquivo fechado) e o Kafka é **streaming contínuo** (o fato fica disponível em milissegundos, não no fechamento do dia). O offset por consumer group é o equivalente moderno de cada job saber "até onde já processei o arquivo de hoje". Quem entende o ciclo de movimento do legado entende Kafka mais rápido que a média — é a mesma ideia, em tempo real e com durabilidade distribuída.
 
 ---
 
-## 9. Ponte com o legado Caixa
+## 9. IA & agentes hoje
 
-Quem operou o batch noturno já fez resiliência sem o vocabulário moderno. O **"reprocessamento do job que deu erro"** é o ancestral do retry; os **"limites de retentativa"** configurados no agendador de jobs são o teto de tentativas; o **"arquivo de rejeitados"** que sobrava para análise no dia seguinte é a **DLT** dos nossos dias. Até o circuit breaker tem parente lá: o operador que, vendo um sistema downstream fora do ar, **suspendia o job** em vez de deixá-lo falhar a noite inteira contra uma dependência morta — exatamente o "falhar rápido" automatizado.
+A arquitetura orientada a eventos virou a espinha dorsal de sistemas de IA sérios:
 
-A diferença é o **regime**: no legado, a resiliência era **batch, manual e no dia seguinte** (rodar de novo o job de manhã). Hoje ela é **reativa, automática e por requisição** — o sistema decide em milissegundos se tenta de novo, se abre o circuito ou se manda para a DLT. Quem entende o ciclo de reprocessamento e rejeição do batch já tem o modelo mental certo; só muda a granularidade e a velocidade.
-
----
-
-## 10. IA & agentes hoje
-
-Resiliência deixou de ser tema de "infra" e virou requisito central de qualquer sistema que chama um **LLM** — porque as APIs de modelo são instáveis por natureza:
-
-- **APIs de LLM falham o tempo todo.** Rate limit (429), timeouts em respostas longas, 5xx esporádicos sob carga. Um agente que chama um modelo sem retry com backoff, timeout e circuit breaker **não sobrevive em produção**. É exatamente o gateway instável da nossa notificação, com latências ainda maiores e cotas mais rígidas (rate limiting não é opcional).
-- **Fallback de modelo.** Quando o circuito abre no modelo primário (caro/maior), o fallback **cai para um modelo secundário** (menor, mais barato, outro provedor) ou retorna uma resposta degradada — em vez de o agente travar. É o `fallbackMethod` da seção 5 aplicado à escolha de modelo.
-- **Idempotência com saída não-determinística.** Aqui mora a parte difícil: reexecutar um passo de IA pode produzir **resultado diferente** (o modelo é não-determinístico). Retry "puro" não basta. A defesa é controlar por **id de tarefa** e **cachear a resposta** da primeira execução bem-sucedida: o retry de uma resposta perdida devolve a saída já gerada, em vez de gerar outra — protegendo contra duplicar efeito **e** custo de token. É a chave de idempotência da seção 4, agora indispensável porque a operação não é naturalmente repetível.
+- **Event-driven para agentes.** Em vez de um orquestrador chamar cada agente diretamente (recriando o acoplamento do gravador ingênuo), os agentes **reagem a eventos** num log. Um agente publica "documento processado"; agentes de resumo, classificação e indexação reagem, cada um no seu grupo. Adicionar um agente novo não toca nos existentes — exatamente o consumer group novo da seção 7.
+- **Event sourcing como memória do agente.** O log de eventos (cada ação, cada observação, cada decisão) é a **memória reproduzível** do agente. Dá auditoria ("por que o agente decidiu isto?") e **replay** (reexecutar a trajetória com um prompt corrigido), do mesmo jeito que reproduzimos o estado de um comprovante. Para um agente em produção financeira, essa trilha não é opcional.
+- **Streaming para ingestão e RAG.** Novos documentos entram como eventos num tópico; um consumidor calcula embeddings e **atualiza o índice vetorial continuamente**, sem reprocessar a base inteira. O índice vira uma projeção do log de documentos — a mesma ideia da seção 6, aplicada ao conhecimento do agente.
 
 ---
 
-## 11. Para ir além
+## 10. Para ir além
 
-- **Resilience4j** — documentação de `Retry`, `CircuitBreaker`, `Bulkhead`, `TimeLimiter` e `RateLimiter` (a referência prática em Java).
-- **Michael Nygard**, *Release It!* — a origem dos *Stability Patterns* (Circuit Breaker, Bulkhead, Timeout); leitura obrigatória.
-- **Spring for Apache Kafka** — `@RetryableTopic`, *Non-Blocking Retries* e *Dead Letter Topics*.
-- **AWS Architecture Blog** — *Exponential Backoff and Jitter* (a análise quantitativa dos tipos de jitter).
-- **Peter Deutsch / L. Peter Deutsch & James Gosling** — *The Fallacies of Distributed Computing* (o catálogo da seção 2).
+- **Documentação Apache Kafka** — conceitos de tópico, partição, offset e consumer group (o ponto de partida canônico).
+- **Martin Kleppmann**, *Designing Data-Intensive Applications* — caps. sobre logs, streams e a dualidade tabela/log; a melhor explicação de event sourcing.
+- **Spring for Apache Kafka** — `KafkaTemplate`, `@KafkaListener` e configuração de consumer groups.
+- **Confluent** — padrões de event-driven architecture e *event sourcing* aplicado.
 
-> **Na próxima aula:** seu sistema agora sobrevive a falhas de **infraestrutura** — rede, dependências, picos. Mas há uma falha que nenhum retry ou breaker pega: o **contrato** entre serviços. Você mudou o JSON que o `comprovante-gravador` espera, e o `emissor` continuou mandando o formato antigo. Compila, sobe, e quebra **em produção**. Como descobrir que você quebrou o consumidor **antes** de subir? Entra o *contract testing*.
+> **Na próxima aula:** o tópico desacoplou os consumidores, mas criou um problema novo. O consumidor de notificação depende de um **gateway externo que oscila**. Quando ele cai e volta, o que acontece? Tentamos de novo — mas tentar de novo **sem piorar o incidente** é engenharia. Entram retry com backoff, idempotência e circuit breaker.

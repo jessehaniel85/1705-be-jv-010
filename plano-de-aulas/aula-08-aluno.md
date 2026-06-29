@@ -1,302 +1,238 @@
-# Material do Aluno — Aula 8: Contract testing com PACT (e evals como contrato)
+# Material do Aluno — Aula 8: Resiliência — retry, circuit breaker e `@RetryableTopic`
 
-> **Tempo de leitura:** ~12 min. Esta é a aula que fecha o ciclo técnico do módulo: você desenhou fronteiras (Aula 1), separou bases, montou mensageria, cache e resiliência — e agora precisa de uma forma de **provar que dois serviços que conversam continuam compatíveis** sem subir o ambiente inteiro toda vez. Contract testing é o mecanismo que transforma "acho que o gravador ainda devolve o JSON certo" em "o CI quebra antes do deploy se ele não devolver". Leia com o seu projeto em mente: o par de serviços mais crítico do seu sistema é o que você vai blindar aqui.
-
----
-
-## 1. O problema gerador
-
-Dois times diferentes mantêm o `comprovante-consulta` e o `comprovante-gravador`. O consulta chama o gravador por REST (`GET /comprovantes/{id}`) para buscar a fonte da verdade quando o cache dá *miss*. Um dia, alguém do time do gravador renomeia o campo `valor` para `valorTransacao` no JSON de resposta, "porque ficou mais claro". O build do gravador passa verde — todos os testes dele continuam passando, afinal o serviço dele funciona. O merge entra. E só **em produção**, quando o consulta tenta desserializar a resposta e recebe `null` no valor, é que a quebra aparece — no serviço do **outro time**, que não mudou uma linha de código.
-
-Esse é o pesadelo do distribuído: a quebra não está dentro de um serviço, está **no espaço entre eles**. Nenhum teste do gravador a pega (ele não sabe quem consome); nenhum teste do consulta a pega (ele usa um mock escrito à mão, com o campo antigo). A pergunta da aula é direta: **como travar essa quebra no CI, antes do deploy, sem subir os cinco serviços juntos?**
+> **Tempo de leitura:** ~13 min. Esta aula é sobre uma verdade desconfortável: num sistema distribuído, **as falhas não são exceção, são rotina**. A rede oscila, dependências ficam lentas, serviços externos retornam 503 sem aviso. A pergunta não é "como evito falhas?" — é "como o meu sistema **falha de propósito**, de um jeito controlado, antes que decida por você do pior jeito?". Leia com cuidado a seção de idempotência: ela é a pré-condição de tudo o que vem depois. Retry sem idempotência não é resiliência, é duplicação de efeito.
 
 ---
 
-## 2. A pirâmide de testes em distribuído (e por que E2E não escala)
+## 1. O problema: reentregar sem afundar o navio
 
-A pirâmide de testes clássica diz: muitos testes **unitários** na base (rápidos, isolados, baratos), alguns de **integração** no meio, e **pouquíssimos** end-to-end (E2E) no topo. Em um monólito isso já é verdade. Em microsserviços, o topo da pirâmide vira uma armadilha cara.
+No nosso projeto-guia, o consumidor de **notificação** lê o tópico `comprovante-gravado` (Aula 6) e, para cada evento, chama um **gateway externo** de notificação (SMS/push). Esse gateway é de terceiro e **oscila**: às vezes responde em 80 ms, às vezes timeout, às vezes retorna 503 por dois minutos durante uma instabilidade.
 
-| Camada | O que testa | Custo | Velocidade | Estabilidade |
-|---|---|---|---|---|
-| **Unitário** | regra de domínio isolada (um agregado, um VO) | baixíssimo | ms | altíssima |
-| **Integração (componente)** | um serviço com suas dependências reais (banco, broker) | médio | s | alta |
-| **Contract test** | a **compatibilidade** entre consumidor e provedor | baixo | s | alta |
-| **E2E** | o fluxo inteiro com os N serviços de pé | altíssimo | min | baixa |
+Queremos três coisas ao mesmo tempo, e elas tensionam entre si:
 
-Por que **E2E não escala** num sistema distribuído:
+1. **Reentregar** quando o gateway se recupera (não perder a notificação por uma falha passageira).
+2. **Parar de tentar** quando ele claramente caiu (não martelar uma dependência morta).
+3. **Não inundá-lo** com retentativas que só aprofundam o buraco.
 
-- **Caro de montar e manter.** Para testar um fluxo de ponta a ponta você precisa subir os cinco serviços, os bancos de cada um, o broker, a fila, o tópico — e manter tudo isso versionado e coerente. O custo de infraestrutura e de manutenção cresce de forma combinatória com o número de serviços.
-- **Lento.** Cada E2E sobe ambiente, espera *health checks*, semeia dados, executa e derruba tudo. Minutos por teste. Um pipeline cheio de E2E faz o feedback do CI passar de segundos para dezenas de minutos — e o time para de rodar.
-- **Frágil (*flaky*).** Quanto mais peças móveis, mais o teste falha por motivos que **não são bug do código**: timeout de rede, ordem de subida, dado residual, *race condition*. Testes que falham aleatoriamente são piores que ausência de teste, porque o time aprende a ignorá-los — e aí o E2E que pegaria um bug real também é ignorado.
-
-A consequência: E2E é ótimo para **um punhado** de jornadas críticas ("emitir e depois consultar um comprovante"), mas é o instrumento errado para responder "o gravador ainda honra o que o consulta espera?". Essa pergunta é de **integração entre dois serviços** — e cobri-la com E2E é matar mosca com canhão.
-
-### A lacuna que o contract testing preenche
-
-Repare no buraco: o mock do gravador usado pelo teste do consulta pode estar desatualizado — ele afirma um contrato que o gravador real **não cumpre mais**. E o teste do gravador **não sabe** que existe um consulta dependente do campo `valor`. Há um acordo implícito que **nenhum dos dois lados testa**. O contract testing fecha exatamente essa lacuna: torna o acordo **explícito e executável** e o roda **dos dois lados** — garantindo que o mock do consumidor e a resposta real do provedor descrevem o **mesmo** contrato.
+O instinto do júnior é envolver a chamada num `try/catch` e tentar de novo num loop. Isso resolve o caso 1 e **piora** os casos 2 e 3 — é a receita do incidente. Resiliência é decidir, **de antemão e explicitamente**, como o sistema se comporta sob falha. As próximas seções são esse repertório de decisões.
 
 ---
 
-## 3. Consumer-driven contracts
+## 2. As falácias da computação distribuída
 
-Há duas formas de pensar um contrato entre serviços. Na abordagem **provider-driven**, o provedor publica "esta é a minha API, consumam como puderem". O problema: o provedor não sabe quais campos cada consumidor realmente usa, então qualquer mudança é arriscada (pode quebrar alguém invisível) e ao mesmo tempo o provedor carrega campos que ninguém consome.
+Em 1994, Peter Deutsch e colegas da Sun catalogaram as **falsas suposições** que todo desenvolvedor faz ao construir sistemas distribuídos — e que cobram caro em produção. Vale conhecê-las pelo nome, porque cada padrão desta aula existe para **contrariar uma delas**:
 
-Na abordagem **consumer-driven contracts (CDC)** — a que o PACT implementa — a direção se inverte: **cada consumidor declara exatamente o que precisa** do provedor (quais campos, formatos, status HTTP), e o conjunto desses contratos vira a especificação que o provedor **deve** honrar. Isso traz três ganhos diretos:
+1. **A rede é confiável.** É a falácia-mãe. A rede cai, perde pacotes, particiona. → exige **retry**.
+2. **A latência é zero.** Chamar um serviço remoto não é como chamar um método local; leva tempo, e esse tempo varia. → exige **timeout**.
+3. **A banda é infinita.** Mandar muito dado satura. → exige **rate limiting** e backpressure.
+4. **A rede é segura.** Nunca é. → exige autenticação, criptografia.
+5. **A topologia não muda.** Instâncias sobem e descem o tempo todo (lembre do rebalance da Aula 6). → exige descoberta de serviço, idempotência.
+6. **Há um único administrador.** Dependências de terceiros (o gateway de notificação, uma API de LLM) mudam sem te avisar. → exige **circuit breaker** e **fallback**.
+7. **O custo de transporte é zero.** Serialização, rede e infra têm custo. → exige eficiência.
+8. **A rede é homogênea.** Protocolos, versões e comportamentos divergem.
 
-- **Mudança segura.** O provedor sabe, de forma executável, o que cada consumidor depende. Ele pode mudar livremente tudo que **nenhum** contrato exige; e descobre na hora se mudou algo que alguém usa.
-- **Contrato mínimo.** O consumidor pede só o que usa. Se o consulta só precisa de `id`, `valor` e `dataHora`, o contrato dele não amarra os outros 20 campos da resposta do gravador.
-- **Compatibilidade verificável.** Como o contrato é gerado pelo consumidor e verificado pelo provedor, os dois lados nunca podem divergir silenciosamente.
-
-CDC é a versão executável do padrão **Published Language / Open Host Service** do context mapping (Aula 1): o contrato deixa de ser um documento e passa a ser um artefato que roda no pipeline.
-
----
-
-## 4. A mecânica do PACT
-
-PACT é a ferramenta de referência para CDC. O nome do artefato central é o **pact file**: um JSON que descreve cada interação esperada (requisição → resposta). O ciclo tem dois lados, sempre nesta ordem:
-
-1. **Lado consumidor (gera o pact).** Você escreve um teste que declara: "quando eu chamar `GET /comprovantes/{id}` com este id, espero status `200` e um corpo com estes campos". O PACT sobe um **mock do provedor** que responde exatamente o que você declarou, roda o **seu código cliente real** contra esse mock (validando que ele de fato monta a requisição certa e consegue ler a resposta), e — se passar — **grava o pact file** em disco. O pact file é a expectativa, agora num arquivo versionável.
-2. **Lado provedor (verifica o pact).** O PACT pega o pact file e **replay** cada interação contra o **provedor real** rodando: faz a requisição declarada e confere se a resposta real bate com a esperada. Se o gravador renomeou `valor` para `valorTransacao`, a verificação **falha aqui**, no CI do gravador — exatamente onde o time que causou a quebra vai vê-la.
-
-O ponto central, e o que mais confunde quem está começando: **o consumidor declara e GERA; o provedor VERIFICA.** O contrato nasce de quem consome (porque é quem sabe o que precisa) e é cobrado de quem provê.
-
-```
-  ┌─────────────────────┐                       ┌─────────────────────┐
-  │ comprovante-consulta│                       │ comprovante-gravador│
-  │     (consumer)      │                       │      (provider)     │
-  ├─────────────────────┤                       ├─────────────────────┤
-  │ teste declara a      │   gera o pact file    │ verificação roda o   │
-  │ expectativa contra   │ ───── (JSON) ──────►  │ pact contra o serviço│
-  │ um MOCK do provedor  │                       │ REAL e confere       │
-  └─────────────────────┘                       └─────────────────────┘
-         GERA                                            VERIFICA
-```
+O fio condutor: **assumir que tudo dá certo é um bug de design.** O código resiliente assume que a chamada remota **vai falhar** e decide o que fazer quando falhar.
 
 ---
 
-## 5. Exemplo trabalhado: contrato do `GET /comprovantes/{id}`
+## 3. Retry: o veneno e o antídoto (retry storm)
 
-Vamos blindar a integração real do projeto: o `comprovante-consulta` (consumer) chama o `comprovante-gravador` (provider) para buscar um comprovante por id quando o cache dá *miss*. Eis o cliente do lado do consulta:
+Retry é a resposta natural à falácia "a rede é confiável": se uma falha pode ser transitória, tente de novo. Mas o retry **ingênuo** — tentar de novo imediatamente, em loop, sem limite — é uma das formas mais rápidas de transformar uma instabilidade pequena num apagão.
+
+O mecanismo do desastre é o **retry storm** (tempestade de retentativas). Imagine que o gateway fica lento por sobrecarga. Mil consumidores recebem timeout **ao mesmo tempo** e, todos juntos, tentam de novo **imediatamente**. O gateway, que estava só sobrecarregado, agora recebe o **dobro** de tráfego no mesmo instante e morre de vez. Quando volta a respirar, os mil clientes tentam de novo, sincronizados, e o derrubam outra vez. O retry, que deveria ajudar, virou um **ataque de negação de serviço involuntário** contra a própria dependência.
+
+Os três antídotos formam a base de qualquer política de retry decente:
+
+- **Backoff exponencial.** Espace as tentativas de forma crescente: 1s, 2s, 4s, 8s. Dá tempo de a dependência se recuperar em vez de ser martelada.
+- **Jitter (aleatoriedade).** Backoff sozinho não basta: se mil clientes falham juntos, eles ainda tentam de novo **juntos** em 1s, depois juntos em 2s — a sincronia persiste. O jitter soma uma aleatoriedade ao intervalo para **espalhar** as retentativas no tempo. Tipos comuns: *full jitter* (intervalo aleatório entre 0 e o backoff calculado — máximo espalhamento), *equal jitter* (metade fixa + metade aleatória) e *decorrelated jitter* (o próximo intervalo deriva aleatoriamente do anterior). Na prática, **full jitter** costuma ser a escolha mais simples e eficaz.
+- **Limite de tentativas.** Nunca tente para sempre. Depois do teto (digamos, 4 tentativas), a mensagem vai para a **DLT/DLQ** (Aula 5) para análise humana. Insistir infinitamente é desperdiçar recurso e mascarar uma falha real.
+
+> A diferença entre 1, 2, 4, 8 segundos **com jitter** e 0, 0, 0, 0 segundos **sem limite** é a diferença entre um sistema que se recupera sozinho e um que entra em colapso. Retry é necessário; retry **disciplinado** é o que separa engenharia de gambiarra.
+
+---
+
+## 4. Idempotência: a pré-condição de qualquer retry
+
+Aqui está a regra que não pode ser negociada: **você só pode tentar de novo com segurança se a operação for idempotente.** Uma operação é **idempotente** quando executá-la N vezes tem o **mesmo efeito** que executá-la uma vez.
+
+Por que isso é vital? Considere o pior cenário do retry: o consumidor de notificação chama o gateway, o gateway **processa e envia o SMS**, mas a **resposta se perde** na rede (timeout do lado do cliente). O consumidor acha que falhou e **tenta de novo**. Sem proteção, o cliente recebe **dois SMS**. Em outro domínio — "debitar R$ 100" — o retry de uma resposta perdida debitaria **R$ 200**. O retry, que existe para não perder a operação, acabou **duplicando** o efeito.
+
+A defesa é tornar a operação idempotente, tipicamente com uma **chave de idempotência** — um identificador único da operação que o receptor usa para detectar repetição:
 
 ```java
-// comprovante-consulta — o cliente REST que conversa com o gravador.
+@Service
+public class NotificacaoService {
+
+    private final NotificacaoRepository repository;
+    private final GatewayCliente gateway;
+
+    public void avisar(ComprovanteGravadoEvent e) {
+        // chave natural: o id do comprovante. Já notificado? não repete.
+        if (repository.jaNotificado(e.comprovanteId())) {
+            return; // idempotente: segunda execução não tem efeito adicional
+        }
+        gateway.enviar(e.chavePixDestino(), e.comprovanteId());
+        repository.marcarNotificado(e.comprovanteId());
+    }
+}
+```
+
+No nosso domínio, o `comprovanteId` é a chave natural — ele identifica unicamente o fato. Repare como tudo se conecta: na Aula 6 escolhemos o `id` do comprovante como **chave de partição** (ordem) e agora ele é também a **chave de idempotência** (deduplicação). O Kafka entrega *at-least-once* por padrão (pode reentregar no rebalance), então **idempotência no consumidor não é opcional** — é o que torna o "pelo menos uma vez" seguro.
+
+---
+
+## 5. Circuit breaker: falhar rápido para se proteger
+
+Retry resolve falhas **transitórias** (um soluço de 200 ms). Mas e quando a dependência caiu **de verdade** e vai ficar fora por minutos? Continuar tentando — mesmo com backoff — desperdiça threads, enche timeouts e pode **propagar a falha em cascata** para o seu próprio serviço. A defesa é o **circuit breaker** (disjuntor), inspirado no disjuntor elétrico: quando a corrente está perigosa, ele **abre** e corta o circuito antes que a casa pegue fogo.
+
+O circuit breaker monitora a taxa de falha das chamadas a uma dependência e transita entre três estados:
+
+| Estado | Comportamento | Transição |
+|---|---|---|
+| **Closed** | Tudo normal; chamadas passam. Falhas são contabilizadas numa janela. | Se a taxa de falha estoura o limiar → **Open** |
+| **Open** | Circuito aberto: chamadas **falham na hora** (sem nem tentar a dependência). Poupa você e dá fôlego à dependência doente. | Após `wait-duration` → **Half-Open** |
+| **Half-Open** | Deixa passar **algumas** chamadas de teste. | Se voltam OK → **Closed**; se falham → **Open** de novo |
+
+O conceito contraintuitivo é **"falhar rápido"**. Quando o circuito está aberto, sua chamada falha **imediatamente** em vez de esperar um timeout de 30 segundos. Isso parece pior ("nem tentei!"), mas é o que **evita esgotar o pool de threads**: 1.000 requisições presas esperando timeout de uma dependência morta congelam o serviço inteiro e derrubam **funcionalidades que nada têm a ver** com o gateway. Falhar rápido contém o dano. Os parâmetros que você configura:
+
+- **Sliding window** — a janela (por contagem ou por tempo) sobre a qual a taxa de falha é medida.
+- **Failure rate threshold** — o percentual de falhas que dispara a abertura (ex.: 50%).
+- **Wait duration in open state** — quanto tempo fica aberto antes de testar (Half-Open).
+
+```java
+// application.yml (Resilience4j)
+//
+// resilience4j:
+//   circuitbreaker:
+//     instances:
+//       gatewayNotificacao:
+//         sliding-window-type: COUNT_BASED
+//         sliding-window-size: 10
+//         failure-rate-threshold: 50          # 50% de falhas → abre
+//         wait-duration-in-open-state: 30s     # 30s aberto, depois half-open
+//         permitted-number-of-calls-in-half-open-state: 3
+
+@Service
+public class GatewayCliente {
+
+    @CircuitBreaker(name = "gatewayNotificacao", fallbackMethod = "fallback")
+    public void enviar(String destino, UUID comprovanteId) {
+        gatewayHttp.post(destino, comprovanteId); // pode estourar timeout / 503
+    }
+
+    // chamado quando o circuito está aberto OU a chamada falha
+    private void fallback(String destino, UUID comprovanteId, Throwable t) {
+        log.warn("Gateway indisponível ({}). Enfileirando para reenvio: {}", t.getMessage(), comprovanteId);
+        reenvioRepository.agendar(comprovanteId); // degrada com elegância, não derruba
+    }
+}
+```
+
+O **fallback** é o par natural do breaker: quando o circuito abre, em vez de explodir, você executa um plano B (enfileirar para depois, retornar uma resposta degradada, usar cache). Falhar de propósito **com** um plano B é o auge da resiliência.
+
+---
+
+## 6. Timeout, bulkhead e rate limiting
+
+O circuit breaker não vem sozinho. Três padrões completam o kit, cada um atacando uma falácia da seção 2.
+
+**Timeout.** Contraria "a latência é zero". **Toda** chamada remota precisa de um teto de tempo. Sem timeout, uma dependência que ficou lenta (não caiu — só lenta) prende suas threads indefinidamente, e o efeito é idêntico ao de uma queda total. Regra: **nunca espere para sempre.** O timeout é também o que **alimenta** o circuit breaker — uma chamada que estoura o timeout conta como falha na janela.
+
+**Bulkhead (anteparo).** O nome vem dos compartimentos estanques de um navio: se um enche d'água, os anteparos impedem que afunde o casco inteiro. Em software, é **isolar pools de recursos por dependência**. Se as chamadas ao gateway de notificação têm seu próprio pool de threads, uma lentidão lá esgota **só aquele pool** — as chamadas à antifraude, que usam outro pool, continuam normais. Sem bulkhead, uma dependência doente consome **todas** as threads do serviço e derruba tudo junto.
+
+```java
+@Bulkhead(name = "gatewayNotificacao", type = Bulkhead.Type.THREADPOOL)
+@CircuitBreaker(name = "gatewayNotificacao", fallbackMethod = "fallback")
+public void enviar(String destino, UUID comprovanteId) {
+    gatewayHttp.post(destino, comprovanteId);
+}
+```
+
+**Rate limiting (brevemente).** Contraria "a banda é infinita". Limita **quantas** chamadas você faz por unidade de tempo a uma dependência. Útil quando o terceiro impõe cota (o gateway aceita 100 req/s) ou quando você quer proteger uma dependência frágil de picos. No Resilience4j é o `@RateLimiter`; conceitualmente, é você **se autolimitando** antes que a dependência te puna com 429.
+
+---
+
+## 7. `@RetryableTopic`: retry e DLT no Spring Kafka
+
+Os padrões acima valem para chamadas síncronas. Mas o consumidor de notificação é **orientado a eventos** — ele lê o tópico Kafka. Aqui há um problema específico: se uma mensagem falha e você fica tentando **dentro** do listener, você **trava o consumo** da partição inteira (lembre: ordem por partição, Aula 6). Uma mensagem problemática bloqueia todas as seguintes — *head-of-line blocking*.
+
+O Spring Kafka resolve isso com `@RetryableTopic`, que implementa retry **não-bloqueante** usando **tópicos auxiliares**. A mensagem que falha não é reprocessada em loop no mesmo lugar; ela é **republicada** num tópico de retry com delay, liberando a partição principal:
+
+```java
 @Component
-public class GravadorClient {
-    private final RestClient http;
+public class NotificacaoListener {
 
-    public GravadorClient(RestClient.Builder b, @Value("${gravador.url}") String url) {
-        this.http = b.baseUrl(url).build();
+    private final NotificacaoService notificacaoService;
+
+    @RetryableTopic(
+            attempts = "4",                                  // 1 original + 3 retries
+            backoff = @Backoff(delay = 1000, multiplier = 2.0), // 1s, 2s, 4s
+            dltStrategy = DltStrategy.FAIL_ON_ERROR)          // esgotou → DLT
+    @KafkaListener(topics = "comprovante-gravado", groupId = "notificacao")
+    public void aoGravar(ComprovanteGravadoEvent e) {
+        notificacaoService.avisar(e); // idempotente (seção 4) → retry seguro
     }
 
-    public Optional<ComprovanteDTO> buscarPorId(UUID id) {
-        return Optional.ofNullable(
-            http.get().uri("/comprovantes/{id}", id)
-                .retrieve()
-                .body(ComprovanteDTO.class));
-    }
-}
-```
-
-### 5.1. Lado consumidor — declara e gera o pact
-
-O teste do consulta declara a interação que ele precisa e roda o `GravadorClient` real contra o mock que o PACT levanta:
-
-```java
-// comprovante-consulta/src/test/java — gera o pact file.
-@ExtendWith(PactConsumerTestExt.class)
-@PactTestFor(providerName = "comprovante-gravador", pactVersion = PactSpecVersion.V4)
-class GravadorContractTest {
-
-    @Pact(consumer = "comprovante-consulta")
-    RequestResponsePact comprovanteExiste(PactDslWithProvider builder) {
-        return builder
-            .given("comprovante 7f3a... existe e está gravado")   // provider state
-            .uponReceiving("busca de comprovante por id existente")
-                .path("/comprovantes/7f3a0e4c-1d2b-4c8a-9f01-2a3b4c5d6e7f")
-                .method("GET")
-            .willRespondWith()
-                .status(200)
-                .headers(Map.of("Content-Type", "application/json"))
-                .body(new PactDslJsonBody()
-                    .uuid("id", "7f3a0e4c-1d2b-4c8a-9f01-2a3b4c5d6e7f")
-                    .numberType("valor", 150.00)          // o consulta DEPENDE de "valor"
-                    .stringType("chavePix", "joao@pix.com")
-                    .datetime("dataHora", "yyyy-MM-dd'T'HH:mm:ss")
-                    .stringMatcher("status", "GRAVADO|ACEITO", "GRAVADO"))
-            .toPact();
-    }
-
-    @Test
-    @PactTestFor(pactMethod = "comprovanteExiste")
-    void leResposataDoGravador(MockServer mock) {
-        var client = new GravadorClient(RestClient.builder(), mock.getUrl());
-
-        var dto = client.buscarPorId(
-            UUID.fromString("7f3a0e4c-1d2b-4c8a-9f01-2a3b4c5d6e7f"));
-
-        assertThat(dto).isPresent();
-        assertThat(dto.get().valor()).isEqualByComparingTo("150.00");  // valida o que importa
+    @DltHandler
+    public void tratarDlt(ComprovanteGravadoEvent e) {
+        // teto de tentativas atingido: parar e pedir olhar humano
+        alertaService.notificarFalhaPermanente(e.comprovanteId());
     }
 }
 ```
 
-Repare em dois pontos de design. Primeiro, usamos **matchers** (`numberType`, `stringType`, `stringMatcher`) e não valores literais: o contrato afirma "existe um campo `valor` que é número", não "o valor é exatamente 150.00". Contrato é sobre **forma e tipo**, não sobre o dado específico — isso evita acoplar o teste a um valor que muda. Segundo, o teste pede **só os campos que o consulta usa**. Se o gravador devolve mais 15 campos, o contrato não se importa — é o CDC em ação.
+O que o Spring cria automaticamente nos bastidores:
 
-### 5.2. Lado provedor — verifica o pact
-
-No `comprovante-gravador`, a verificação sobe o serviço real e faz o replay do pact:
-
-```java
-// comprovante-gravador/src/test/java — verifica o pact contra o serviço real.
-@Provider("comprovante-gravador")
-@PactFolder("pacts")                       // lê os pact files gerados pelo consumer
-@SpringBootTest(webEnvironment = RANDOM_PORT)
-class GravadorVerificacaoTest {
-
-    @LocalServerPort int porta;
-    @Autowired ComprovanteRepository repo;
-
-    @BeforeEach
-    void target(PactVerificationContext ctx) {
-        ctx.setTarget(new HttpTestTarget("localhost", porta));
-    }
-
-    @TestTemplate
-    @ExtendWith(PactVerificationInvocationContextProvider.class)
-    void verificaContrato(PactVerificationContext ctx) {
-        ctx.verifyInteraction();           // replay de cada interação do pact
-    }
-
-    // provider state: semeia o dado que o pact assume existir.
-    @State("comprovante 7f3a... existe e está gravado")
-    void semeiaComprovante() {
-        repo.save(new Comprovante(
-            UUID.fromString("7f3a0e4c-1d2b-4c8a-9f01-2a3b4c5d6e7f"),
-            new Dinheiro(new BigDecimal("150.00"), "BRL"),
-            new ChavePix(TipoChave.EMAIL, "joao@pix.com"),
-            StatusComprovante.GRAVADO));
-    }
-}
+```
+comprovante-gravado            (principal)
+comprovante-gravado-retry-0    (delay 1s)
+comprovante-gravado-retry-1    (delay 2s)
+comprovante-gravado-retry-2    (delay 4s)
+comprovante-gravado-dlt        (dead-letter topic: parou aqui)
 ```
 
-Se alguém no gravador renomear `valor` para `valorTransacao`, `verificaContrato` falha com uma mensagem precisa ("esperado campo `valor`, não encontrado") — no CI do gravador, no commit que causou o problema. A quebra de produção virou um build vermelho.
+A mensagem desce essa escada de retry com backoff exponencial; se todas as tentativas falham, cai na **DLT** — o "fim da linha" onde a equipe investiga sem perder o evento. Repare como `@RetryableTopic` (retry no nível da entrega da mensagem) e `@CircuitBreaker` (proteção da chamada externa dentro do `avisar`) **se compõem**: o breaker evita que cada tentativa de retry martele um gateway morto, e o retry garante que falhas transitórias não percam a notificação. E nada disso é seguro sem a **idempotência** da seção 4 — porque retry, por definição, reexecuta.
 
 ---
 
-## 6. Provider states — semeando o dado
+## 8. Exemplo trabalhado: o caminho completo de uma notificação
 
-O pact da seção 5 assume que **existe** um comprovante com aquele id. Mas o gravador, num teste limpo, tem o banco vazio. Como a verificação encontra esse dado? Pelo **provider state**: o `given("comprovante ... existe e está gravado")` do consumidor é uma **etiqueta** que, no provedor, casa com um método `@State` de mesmo nome. Esse método roda **antes** da interação e **semeia o pré-requisito** — no exemplo, ele salva o comprovante no repositório.
+Juntando as peças, vamos seguir um evento `comprovante-gravado` em três cenários.
 
-Provider state é o que mantém o contrato **independente do estado global do banco**: cada interação declara seu próprio pré-requisito ("dado que X existe", "dado que X **não** existe") e o provedor sabe montar exatamente esse cenário. Você terá um `@State` para o caso de comprovante existente (resposta 200) e outro para o inexistente (resposta 404), e cada um semeia — ou limpa — só o que aquela interação precisa.
+**Cenário A — gateway saudável.** O listener recebe o evento, `avisar` verifica que não foi notificado, o circuit breaker está *closed*, o gateway responde OK, marca como notificado. Uma execução, um SMS.
 
----
+**Cenário B — falha transitória (gateway soluça).** Timeout na primeira tentativa. `@RetryableTopic` republica no `retry-0` com 1s de delay; na segunda, o gateway respondeu OK. A idempotência garante que, se o SMS tinha sido enviado mas a resposta se perdeu, o `jaNotificado` impede o segundo envio. Notificação entregue, **sem duplicação**, sem travar a partição.
 
-## 7. Pact Broker e `can-i-deploy`
+**Cenário C — falha permanente (gateway fora há minutos).** As primeiras falhas enchem a sliding window; ao cruzar 50%, o **circuit breaker abre**. Cada tentativa passa a **falhar na hora** (sem esperar timeout) e cai no `fallback`, que **enfileira para reenvio** em vez de explodir. Esgotadas as 4 tentativas, a mensagem vai para a **DLT** e o `@DltHandler` dispara um alerta. O serviço **continua de pé**, sem esgotar threads e sem derrubar antifraude e BI (isolados por bulkhead + consumer groups separados). Quando o gateway volta, o breaker passa a *half-open*, testa, fecha, e o reenvio é drenado.
 
-Pact files em disco resolvem o caso de um repositório só. Em escala, com vários consumidores e provedores evoluindo em ritmos diferentes, surge a pergunta de versionamento: *"esta versão do gravador é compatível com as versões de consulta que estão em produção agora?"*. Responder isso à mão é inviável.
-
-O **Pact Broker** é um servidor que centraliza os pact files e os associa a **versões** de cada serviço e a **ambientes** (`production`, `staging`). Cada lado publica seu resultado: o consumidor publica o pact que gerou; o provedor publica que verificou (ou não) aquele pact. Com isso o Broker mantém uma **matriz de compatibilidade**: quem é compatível com quem, em qual versão.
-
-Sobre essa matriz roda o comando `can-i-deploy`, a peça que entra no pipeline antes de cada deploy:
-
-```bash
-# "Posso subir esta versão do gravador para produção sem quebrar ninguém?"
-pact-broker can-i-deploy \
-  --pacticipant comprovante-gravador \
-  --version "$GIT_SHA" \
-  --to-environment production
-```
-
-Se algum consumidor que está em produção depende de algo que esta versão do gravador **não** honra mais, o comando retorna erro e o **deploy é bloqueado**. É a tradução literal da frase-síntese da aula: contrato bom é o que **falha no seu CI**, não na produção do outro time.
-
-> No nosso ambiente (sem Docker), o Pact-JVM roda com os **pact files em disco** e a verificação do provedor **em processo** — Docker-free, e por isso este tema é o mais tranquilo do módulo. O **Pact Broker** (com `can-i-deploy` no pipeline) é o passo de produção que você verá em serviços modernos — você precisa **saber explicá-lo na banca** mesmo sem subi-lo aqui.
+Os três cenários com a **mesma** configuração. Isso é "decidir como falhar de propósito": o comportamento sob falha não é improviso — está desenhado.
 
 ---
 
-## 8. Message pacts — contrato de mensagem, não só de HTTP
+## 9. Ponte com o legado Caixa
 
-Nem toda integração do seu sistema é REST. O `comprovante-emissor` fala com o `comprovante-gravador` por **fila**, e o gravador publica `ComprovanteGravado` num **tópico** que a notificação consome. Esses acoplamentos também têm contrato — e quebram do mesmo jeito quando alguém muda o formato da mensagem.
+Quem operou o batch noturno já fez resiliência sem o vocabulário moderno. O **"reprocessamento do job que deu erro"** é o ancestral do retry; os **"limites de retentativa"** configurados no agendador de jobs são o teto de tentativas; o **"arquivo de rejeitados"** que sobrava para análise no dia seguinte é a **DLT** dos nossos dias. Até o circuit breaker tem parente lá: o operador que, vendo um sistema downstream fora do ar, **suspendia o job** em vez de deixá-lo falhar a noite inteira contra uma dependência morta — exatamente o "falhar rápido" automatizado.
 
-O PACT cobre isso com **message pacts**: em vez de requisição/resposta HTTP, o contrato descreve a **mensagem** que o produtor emite e o consumidor espera. A mecânica espelha o caso HTTP: o **consumidor da mensagem** (a notificação) declara "espero uma mensagem com estes campos" e gera o pact; o **produtor** (o gravador) é verificado — o PACT chama o código que produz a mensagem e confere se o payload bate com o contrato, **sem precisar de broker real no teste**.
-
-```java
-// notificacao (consumer da mensagem): declara o contrato do evento ComprovanteGravado.
-@Pact(consumer = "comprovante-notificacao")
-MessagePact eventoGravado(MessagePactBuilder builder) {
-    return builder
-        .expectsToReceive("evento de comprovante gravado")
-        .withContent(new PactDslJsonBody()
-            .uuid("comprovanteId")
-            .stringType("chavePix")
-            .datetime("gravadoEm"))
-        .toPact();
-}
-```
-
-Assim a fronteira assíncrona — não só a REST — fica protegida no CI. Um message pact é o contrato do seu **tópico/fila**, e ele é tão verificável quanto o de um endpoint.
+A diferença é o **regime**: no legado, a resiliência era **batch, manual e no dia seguinte** (rodar de novo o job de manhã). Hoje ela é **reativa, automática e por requisição** — o sistema decide em milissegundos se tenta de novo, se abre o circuito ou se manda para a DLT. Quem entende o ciclo de reprocessamento e rejeição do batch já tem o modelo mental certo; só muda a granularidade e a velocidade.
 
 ---
 
-## 9. Evolução e compatibilidade de schema
+## 10. IA & agentes hoje
 
-Contratos existem para poder **mudar com segurança**. A regra que governa a evolução é a distinção entre mudança **compatível** e **incompatível**:
+Resiliência deixou de ser tema de "infra" e virou requisito central de qualquer sistema que chama um **LLM** — porque as APIs de modelo são instáveis por natureza:
 
-- **Compatível (não quebra consumidores):** adicionar um campo **novo opcional** na resposta; aceitar um campo novo opcional na requisição; relaxar uma validação. Consumidores antigos ignoram o que não conhecem.
-- **Incompatível (quebra):** **remover** ou **renomear** um campo que algum consumidor usa; mudar o **tipo** de um campo; tornar **obrigatório** um campo antes opcional; mudar a semântica de um valor.
-
-A estratégia segura para uma mudança incompatível é **expand and contract** (também chamada de *parallel change*): primeiro **adicione** o novo formato mantendo o antigo (fase *expand*), migre cada consumidor para o novo, confirme via `can-i-deploy` que ninguém usa mais o antigo, e só então **remova** o velho (fase *contract*). O contract test é o que torna esse processo seguro: ele diz, a qualquer momento, **quem ainda depende do quê**.
-
----
-
-## 10. Arquitetura amigável a testes
-
-Tudo acima só é barato se o código **colabora**. Contract testing — e teste em geral — é uma **consequência de design**, não algo que se adiciona no fim:
-
-- **Injeção de dependência.** O `GravadorClient` recebe a URL base por construtor; por isso o teste consegue apontá-lo para o `mock.getUrl()` sem nenhuma gambiarra. Dependência *hardcoded* (um `new RestClient()` com URL fixa dentro do método) torna o serviço impossível de redirecionar para o mock.
-- **Fronteiras explícitas.** A conversa com o gravador está **isolada** num cliente dedicado (`GravadorClient`), não espalhada por dez serviços. A fronteira é o lugar exato onde o contrato se aplica — e onde o teste se prende.
-- **Determinismo onde importa.** Tudo que é não-determinístico (relógio, UUID, ordem) precisa ser **injetável** (`Clock`, gerador de id), senão o teste oscila. O provider state semeia dados determinísticos justamente para que o replay do pact seja reprodutível.
-- ***Side effects* isolados.** Persistência, envio de mensagem e chamadas externas atrás de portas explícitas — para que o teste substitua o que é caro e exercite o que é regra.
-
-A heurística: se escrever o contract test deu trabalho, provavelmente o problema não é o PACT — é que a fronteira do seu serviço não estava explícita. O teste difícil é um **sintoma de design**, e arrumá-lo melhora a arquitetura, não só a suíte.
+- **APIs de LLM falham o tempo todo.** Rate limit (429), timeouts em respostas longas, 5xx esporádicos sob carga. Um agente que chama um modelo sem retry com backoff, timeout e circuit breaker **não sobrevive em produção**. É exatamente o gateway instável da nossa notificação, com latências ainda maiores e cotas mais rígidas (rate limiting não é opcional).
+- **Fallback de modelo.** Quando o circuito abre no modelo primário (caro/maior), o fallback **cai para um modelo secundário** (menor, mais barato, outro provedor) ou retorna uma resposta degradada — em vez de o agente travar. É o `fallbackMethod` da seção 5 aplicado à escolha de modelo.
+- **Idempotência com saída não-determinística.** Aqui mora a parte difícil: reexecutar um passo de IA pode produzir **resultado diferente** (o modelo é não-determinístico). Retry "puro" não basta. A defesa é controlar por **id de tarefa** e **cachear a resposta** da primeira execução bem-sucedida: o retry de uma resposta perdida devolve a saída já gerada, em vez de gerar outra — protegendo contra duplicar efeito **e** custo de token. É a chave de idempotência da seção 4, agora indispensável porque a operação não é naturalmente repetível.
 
 ---
 
-## 11. Ponte com o legado Caixa
+## 11. Para ir além
 
-Contract testing não é um conceito novo — é a versão **executável** de algo que o mundo corporativo sempre teve: o **contrato de interface**. Em sistemas legados, o acordo entre dois sistemas vivia num **documento Word, numa planilha de layout de arquivo posicional ou num PDF de "especificação de interface"** — "as posições 1 a 11 são o CPF, 12 a 26 o valor com duas casas decimais", e assim por diante. Quem integrou com mainframe via arquivo CNAB, EDI ou *copybook* conhece bem esse documento.
+- **Resilience4j** — documentação de `Retry`, `CircuitBreaker`, `Bulkhead`, `TimeLimiter` e `RateLimiter` (a referência prática em Java).
+- **Michael Nygard**, *Release It!* — a origem dos *Stability Patterns* (Circuit Breaker, Bulkhead, Timeout); leitura obrigatória.
+- **Spring for Apache Kafka** — `@RetryableTopic`, *Non-Blocking Retries* e *Dead Letter Topics*.
+- **AWS Architecture Blog** — *Exponential Backoff and Jitter* (a análise quantitativa dos tipos de jitter).
+- **Peter Deutsch / L. Peter Deutsch & James Gosling** — *The Fallacies of Distributed Computing* (o catálogo da seção 2).
 
-O problema do contrato-em-documento é que ele **não roda**. Ele envelhece, diverge do código, e ninguém revalida — até o dia em que o sistema A muda o layout, esquece de avisar o sistema B, e a quebra aparece em produção (exatamente o pesadelo da seção 1, só que com 30 anos a mais). O *batch* noturno rejeita o arquivo inteiro, ou pior, lê o campo errado silenciosamente.
-
-Contract testing pega esse mesmo acordo e o torna **código que roda no pipeline**: o "layout de interface" vira o pact file, e a "conferência manual do layout" vira a verificação automática no CI. Para o veterano de integrações Caixa, a mensagem é direta — **é o mesmo contrato de interface de sempre, só que agora ele falha no seu build, não na produção do outro time.** Quem já desenhou layout de arquivo CNAB entende contract testing em cinco minutos; só muda o ferramental.
-
----
-
-## 12. IA & agentes hoje
-
-A mesma ideia de "contrato executável" governa como se testa um componente de IA — e é onde o tema mais cresce hoje:
-
-- **Testar saída não-determinística.** Você não faz `assertEquals` no texto de um LLM: a mesma entrada gera saídas diferentes. O que você testa é **schema, invariantes e propriedades** — o JSON tem todos os campos obrigatórios? o valor está no intervalo permitido? a estrutura bate com o esperado? É exatamente a lógica dos **matchers** do PACT (forma e tipo, não valor literal) aplicada à saída de um modelo.
-- **Evals como contrato.** Uma suíte de *evals* — casos de entrada com critérios de aceitação sobre a saída — é o **contract test de um componente de IA**: ela define o comportamento aceitável e roda no CI, exatamente como um pact define o comportamento aceitável de uma API. Mudou o prompt, o modelo ou a temperatura? A eval falha se a qualidade regrediu, antes de chegar ao usuário.
-- ***Structured outputs* / JSON schema como contrato.** Forçar o modelo a responder num **JSON schema** declarado é o equivalente direto a um contrato de API: você define a forma da saída e a **valida** contra o schema como validaria a resposta de um provedor. O schema vira a fronteira verificável entre o componente de IA e o resto do sistema — o consumidor do modelo declara o que precisa, e a saída é checada contra isso. CDC, de novo, num contexto novo.
-
-A lição transfere inteira: em um mundo de geração não-determinística (de dados ou de texto), a confiança não vem de comparar saídas exatas — vem de **declarar e verificar contratos sobre a forma e as propriedades** da saída.
-
----
-
-## 13. Armadilhas comuns
-
-- **Confiar só em E2E.** Lento, instável, e ainda dá a falsa sensação de que cobre tudo. Use E2E para um punhado de jornadas; cubra integração com contract test.
-- **Contrato que ninguém roda no CI.** Um pact que não está no pipeline volta a ser documento morto — exatamente o que você queria substituir.
-- **Acoplar o contrato ao detalhe interno do provedor.** O contrato é sobre a **necessidade do consumidor** (campos que ele usa), não sobre a implementação do provedor. Pedir literais em vez de matchers, ou amarrar campos que você não consome, deixa o contrato frágil.
-- **Esquecer o provider state.** Sem semear o dado, a verificação falha por dado ausente — e o time culpa o PACT em vez do *setup*.
-
----
-
-## 14. Para ir além
-
-- **Documentação do Pact** (pact.io) — consumer-driven contracts, provider states, message pacts e `can-i-deploy`.
-- **Martin Fowler** — verbetes *ContractTest*, *ConsumerDrivenContracts* e *TestPyramid* (martinfowler.com).
-- **Pact Broker** — documentação de versionamento de contrato e da matriz de compatibilidade.
-- **Guias de *LLM evals*** — avaliação de saída não-determinística por critérios, schema e propriedades (a ponte da seção 11).
-
-> **Na próxima aula:** o código está pronto e blindado por contratos. Mas a Aula 9 não pede mais código — ela pede que você **defenda** suas decisões diante de uma banca. Por que estes bounded contexts? Por que fila aqui e tópico ali? Seu cache pode servir dado velho — e isso é aceitável? Saber construir o sistema é metade; a outra metade é **justificar cada trade-off** sob arguição. O próximo material é o guia para chegar à banca preparado.
+> **Na próxima aula:** seu sistema agora sobrevive a falhas de **infraestrutura** — rede, dependências, picos. Mas há uma falha que nenhum retry ou breaker pega: o **contrato** entre serviços. Você mudou o JSON que o `comprovante-gravador` espera, e o `emissor` continuou mandando o formato antigo. Compila, sobe, e quebra **em produção**. Como descobrir que você quebrou o consumidor **antes** de subir? Entra o *contract testing*.

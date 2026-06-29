@@ -1,204 +1,199 @@
-# Material do Aluno — Aula 5: Filas com RabbitMQ + idempotência e DLQ
+# Material do Aluno — Aula 5: Comunicação assíncrona (producer/consumer)
 
-> **Tempo de leitura:** ~13 min. Na Aula 4 você desacoplou a emissão da gravação com uma fila "pronta". Agora abrimos a caixa-preta: como uma fila de verdade **roteia**, **confirma** e **isola** mensagens — e por que o tratamento de falha não é um detalhe de configuração, é o coração do design. O fio condutor é uma pergunta concreta: *quando a gravação do comprovante falha três vezes seguidas, a mensagem some?* A resposta — "nunca por acidente" — depende de cada peça desta aula. O exemplo trabalhado da seção 8 mostra como **provar** a DLQ com uma mensagem envenenada.
+> **Tempo de leitura:** ~12 min. Esta é a aula em que o sistema deixa de ser "uma request, uma resposta, tudo no mesmo fio" e passa a ter **partes que vivem em ritmos diferentes**. O conceito central — desacoplamento — parece simples, mas cada decisão que ele abre (mensagem ou evento? quantas vezes a mensagem chega? e se o consumidor cair?) tem trade-offs que separam quem leu sobre filas de quem opera filas em produção. O exemplo trabalhado da seção 7 é o coração do projeto-guia.
+>
+> **Onde isto encaixa:** a Aula 3 deu o *mapa* dos três eixos da comunicação (síncrono×assíncrono, comando×evento, orquestração×coreografia) e o lugar de broker/ESB/Camel. Esta aula pega o eixo **síncrono→assíncrono** e o constrói de verdade.
 
 ---
 
-## 1. Dois tipos de falha que não podem ser tratados igual
+## 1. O problema gerador: aceitar agora, processar depois
 
-A gravação do comprovante PIX falha de **dois jeitos fundamentalmente diferentes**, e a confusão entre eles é a origem de quase todo incidente de fila em produção:
+No projeto de Comprovantes PIX, a gravação do comprovante na base de verdade é a parte **lenta e instável** do fluxo. Ela depende de um banco que, em dia de pico (pagamento, 13º), oscila: às vezes responde em 30 ms, às vezes em 4 s, às vezes está fora por alguns segundos durante um failover. O cliente, do outro lado, acabou de fazer um PIX e quer o comprovante **agora**.
 
-- **Falha transitória:** algo momentâneo. O banco oscilou durante um failover, a conexão caiu, houve um deadlock, o pool de conexões esgotou por um instante. A mensagem está **perfeita**; só teve azar de chegar num mau momento. **Tentar de novo resolve.**
-- **Falha permanente:** algo estrutural. A mensagem está malformada (um campo obrigatório nulo, um valor que viola uma constraint, um enum desconhecido por incompatibilidade de versão). Tentar de novo **nunca** vai resolver — vai falhar exatamente igual, para sempre.
+A solução ingênua é síncrona: o `POST /comprovantes` valida, grava no banco e só então responde `201 Created`. Funciona no laboratório. Em produção ela tem dois defeitos fatais:
 
-Tratar os dois do mesmo jeito leva a um de dois desastres:
+- **Acoplamento de disponibilidade:** se o banco está fora, a emissão está fora. Uma falha na parte mais frágil derruba a parte mais visível. O cliente recebe `500` por algo que nem é culpa da emissão.
+- **Acoplamento de latência:** o cliente paga o tempo da gravação. No pico, isso vira timeout, retry do app mobile, request duplicada e a sensação de "o comprovante demora a aparecer".
 
-| Estratégia única | Consequência na falha transitória | Consequência na falha permanente |
+A saída é inverter a lógica: **aceitar agora e processar depois**. A emissão valida o que precisa validar de forma síncrona (a regra de negócio, os value objects), responde **`202 Accepted`** com o `id` do comprovante e **publica** uma tarefa de gravação numa fila. Outro componente — o consumidor — grava no seu próprio tempo, com suas próprias tentativas, sem o cliente esperando.
+
+Você não eliminou o trabalho lento. Você o **moveu para fora do caminho da resposta**. E ao fazer isso, assumiu um conjunto de responsabilidades novas que esta aula inteira existe para detalhar.
+
+> O `202 Accepted` é uma promessa, não uma confirmação. Ele diz "recebi e vou processar", não "gravei". Isso muda o contrato com o cliente: a consulta passa a poder retornar "ainda processando" por uma janela curta — exatamente o *hotspot* que o event storming da Aula 1 já tinha previsto.
+
+---
+
+## 2. Producer e consumer: o desacoplamento temporal
+
+O padrão tem duas pontas e um intermediário:
+
+- **Producer (produtor):** publica mensagens **sem saber quem** vai consumir, nem **quando**. Ele conhece a *intenção* ("preciso que este comprovante seja gravado"), não o destinatário.
+- **Broker (intermediário):** guarda a mensagem de forma durável até alguém consumir. É o RabbitMQ, o Kafka, o IBM MQ.
+- **Consumer (consumidor):** processa no **seu ritmo**, podendo escalar em paralelo (vários consumidores na mesma fila) ou pausar e retomar.
+
+O ganho que justifica toda a complexidade é o **desacoplamento temporal**: produtor e consumidor **não precisam estar vivos ao mesmo tempo** — o broker é o buffer que absorve o pico e segura a mensagem enquanto o consumidor não dá conta.
+
+> O trade-off completo **síncrono × assíncrono** (disponibilidade, latência, absorção de pico, acoplamento de localização, custo operacional) você já mapeou na **Aula 3, §2** — não vamos repetir a tabela. O essencial para esta aula: o assíncrono **não é grátis**; troca simplicidade por disponibilidade e elasticidade, e a §8 fecha com **quando não fazer isso**.
+
+---
+
+## 3. Mensagem, comando e evento: três coisas diferentes
+
+A **Aula 3 (§3)** já deu a regra que separa os dois — *"consigo adicionar um consumidor sem tocar no produtor? → evento"*. Aqui ela vira **decisão de projeto**, com a armadilha que mais derruba arquitetura distribuída. Relembrando em uma linha:
+
+- **Comando** = *"faça isto"*: dirigido a **um** dono lógico, no imperativo (`GravarComprovanteCommand`); o produtor **espera** a ação e sabe que a pediu.
+- **Evento** = *"isto aconteceu"*: um fato no passado (`ComprovanteGravadoEvent`) que **qualquer interessado** observa; o produtor **não sabe nem se importa** com quem reage (zero, um ou dez: notificação, antifraude, BI).
+
+| Aspecto | Comando | Evento |
 |---|---|---|
-| **Descartar ao primeiro erro** | perde comprovante bom por azar momentâneo — catastrófico | "limpa" a fila, mas perde o dado e a evidência do bug |
-| **Reprocessar para sempre** | correto: a próxima tentativa funciona | trava a fila num loop infinito de falha (a *poison message*) |
+| Significado | "faça isto" | "isto aconteceu" |
+| Tempo verbal | imperativo (`Gravar...`) | particípio (`...Gravado`) |
+| Destinatário | um (quem deve agir) | N interessados (broadcast) |
+| Acoplamento | produtor conhece a intenção da ação | produtor ignora quem consome |
+| Acoplamento de evolução | quebrar muda quem executa | adicionar consumidor não afeta o produtor |
+| Exemplo no PIX | `GravarComprovanteCommand` (Aulas 5/6) | `ComprovanteGravadoEvent` (Aula 7) |
 
-A arquitetura certa **distingue** os dois: falha transitória → **retry com backoff** (tenta de novo, espaçado, algumas vezes); falha permanente → **Dead Letter Queue** (isola para inspeção humana, sem nunca descartar). O resto da aula é construir essa distinção peça por peça.
+**Por que a distinção é de projeto, não de detalhe?** Porque ela define **a direção do acoplamento**. Quando o produtor de um "evento" começa a esperar uma ação específica de um consumidor específico — "publiquei `ComprovanteGravado` e *preciso* que o serviço de notificação faça X" — esse evento virou um **comando disfarçado**, e você recriou o acoplamento que a fila deveria ter quebrado. É a regra da Aula 3 vista pelo avesso: o acoplamento que você jurou eliminar voltando pela porta dos fundos.
 
----
-
-## 2. Anatomia do RabbitMQ: por que não se publica direto na fila
-
-A primeira surpresa de quem vem de uma `BlockingQueue` em memória: no RabbitMQ (e no AMQP em geral) o produtor **não publica numa fila**. Ele publica numa **exchange**, e a exchange decide para quais filas a mensagem vai. Há quatro peças:
-
-- **Exchange:** o ponto de entrada. Recebe a mensagem do produtor e a **roteia**. Não armazena nada.
-- **Queue (fila):** onde a mensagem **fica** até ser consumida. É a parte durável.
-- **Binding:** a "ligação" que conecta uma exchange a uma fila, com uma regra.
-- **Routing key:** o rótulo que o produtor põe na mensagem; a exchange compara a routing key com os bindings para decidir o destino.
-
-```
-            routing key = "comprovante.gravar"
-producer ─────────────────────────────▶ [ exchange ] ──binding──▶ [ fila gravacao.q ] ──▶ consumer
-                                              │
-                                              └──binding──▶ [ fila auditoria.q ] ──▶ consumer
-```
-
-**Por que essa indireção?** Porque ela é exatamente o desacoplamento da Aula 3 sobre mensagem × evento, agora em infraestrutura. O produtor conhece a **intenção** (a exchange + a routing key), **não o consumidor**. Adicionar um segundo consumidor (uma fila de auditoria que também quer toda gravação) é criar um novo binding — **sem tocar no produtor**. Se o produtor publicasse direto na fila, ele estaria acoplado a cada consumidor existente. A exchange é o que torna o sistema extensível.
-
-### Tipos de exchange
-
-A regra de roteamento depende do **tipo** da exchange:
-
-| Tipo | Regra de roteamento | Quando usar | Exemplo no PIX |
-|---|---|---|---|
-| **direct** | routing key **exata** = chave do binding | comando para um destino específico | `comprovante.gravar` → fila de gravação |
-| **topic** | padrão com curingas (`*` = uma palavra, `#` = várias) | roteamento por categoria/hierarquia | `comprovante.gravado` para BI; `comprovante.*` para auditoria |
-| **fanout** | **ignora** a routing key; replica para **todas** as filas ligadas | broadcast puro de um evento | "comprovante gravado" para notificação + antifraude + BI (Aula 6) |
-| **headers** | casa por atributos do cabeçalho em vez de routing key | roteamento por metadados complexos | raro; roteamento por região/tipo |
-
-Para a **fila de gravação** (um comando, um destino), o tipo certo é **direct**: a routing key `comprovante.gravar` cai exatamente na fila do gravador. Quando, na Aula 6, o evento "comprovante gravado" precisar chegar a vários interessados de uma vez sem o produtor saber quem são, o tipo certo será **fanout** ou **topic**. Guarde o contraste: **direct para comando, fanout/topic para evento** — é a mesma distinção da Aula 4, materializada em exchange.
+No projeto PIX, a gravação é um **comando** (a emissão *pede* que se grave; há um responsável claro). Já o "comprovante foi gravado" é um **evento** (a gravação anuncia um fato; quem reage é problema de quem reage). Esta aula trata do comando; a Aula 7 trata do evento.
 
 ---
 
-## 3. Ack, nack manual e redelivery
+## 4. Garantias de entrega — e o mito do exactly-once
 
-Por padrão, um consumidor poderia confirmar a mensagem **no momento em que a recebe** (auto-ack). Isso é perigoso: se o consumidor cai **depois** de receber e **antes** de gravar, a mensagem já foi confirmada e **se perde**. Para um comprovante, inaceitável.
+Quando uma mensagem cruza a rede, há três níveis possíveis de garantia. Cada um tem um custo, e o custo é o que ninguém conta nos slides.
 
-A configuração correta é **ack manual**: o consumidor confirma (**ack**) **só depois** de processar com sucesso. As três respostas possíveis ao broker:
+- **At-most-once (no máximo uma vez):** a mensagem é entregue zero ou uma vez. Nunca duplica, mas **pode perder**. O produtor dispara e esquece; se o broker cair antes de persistir, a mensagem some. Custo baixo, perda aceitável só para dados descartáveis (métrica de telemetria, log de UI). **Inaceitável** para um comprovante bancário.
+- **At-least-once (ao menos uma vez):** a mensagem **nunca se perde**, mas **pode duplicar**. O produtor reenvia se não recebeu confirmação; o broker reentrega se o consumidor não confirmou (ack). É o **padrão prático** da indústria, porque "perder um comprovante" é catastrófico e "gravar duas vezes" é um problema que você **pode** resolver.
+- **Exactly-once (exatamente uma vez):** o ideal — nunca perde, nunca duplica. É o que todo mundo quer e quase ninguém entrega de verdade.
 
-- **ack (acknowledge):** "processei com sucesso, pode descartar a mensagem". O broker remove da fila.
-- **nack (negative ack) / reject:** "não consegui processar". Aqui há uma escolha crítica: `requeue=true` devolve a mensagem à fila (para nova tentativa); `requeue=false` **descarta ou envia para dead-letter** (veremos na seção 6).
-- **nenhuma resposta + queda do consumidor:** o broker não recebeu ack, então **reentrega** (redelivery) a mensagem — para o mesmo ou outro consumidor.
+### O mito do exactly-once
+
+Entrega exatamente-uma-vez **de ponta a ponta** é, na prática distribuída, impossível de garantir só no transporte. O raciocínio: o consumidor processa a mensagem e, antes de confirmar o ack, cai. O broker, sem o ack, **tem** que reentregar — mas não consegue distinguir "processou e caiu" de "não processou e caiu". Portanto, em algum cenário de falha, ou ele perde ou ele duplica. Não há terceira opção no transporte puro.
+
+O que se chama de "exactly-once" em produtos comerciais é, no fundo, **at-least-once + idempotência no consumidor**: a mensagem pode chegar duas vezes, mas o **efeito final** é "como se" tivesse chegado uma. Você não evita a duplicata; você a torna **inofensiva**.
+
+> A frase para guardar: *exactly-once delivery* é mito; *exactly-once processing* (efeito) é alcançável — e a ferramenta é a idempotência do consumidor, não uma mágica do broker. Quem promete exactly-once puro geralmente está escondendo a premissa de que o seu processamento já é idempotente.
+
+---
+
+## 5. Idempotência do consumidor (na prática)
+
+Idempotência é a propriedade de uma operação que, executada **uma ou N vezes com a mesma entrada, produz o mesmo resultado**. Como o broker entrega *at-least-once*, o consumidor **tem** que ser idempotente — não é opcional, é o que torna o at-least-once seguro.
+
+A estratégia mais direta para a gravação do comprovante é usar o **identificador de negócio** (o `id` do comprovante, gerado na emissão) como chave de deduplicação. Antes de gravar, verifica se já existe:
 
 ```java
-@RabbitListener(queues = "comprovante.gravar.q", ackMode = "MANUAL")
-public void aoReceber(GravarComprovanteCommand cmd, Channel canal,
-                      @Header(AmqpHeaders.DELIVERY_TAG) long tag) throws IOException {
-    try {
-        gravar(cmd);                 // processa
-        canal.basicAck(tag, false);  // confirma só após sucesso
-    } catch (FalhaTransitoria e) {
-        canal.basicNack(tag, false, true);  // requeue=true → tenta de novo
-    } catch (MensagemInvalida e) {
-        canal.basicNack(tag, false, false); // requeue=false → vai para a DLQ
+@Component
+public class GravadorDeComprovante {
+
+    private final ComprovanteRepository repositorio;
+
+    public GravadorDeComprovante(ComprovanteRepository repositorio) {
+        this.repositorio = repositorio;
+    }
+
+    // Idempotente: reprocessar a MESMA mensagem não cria um segundo comprovante.
+    public void gravar(GravarComprovanteCommand cmd) {
+        if (repositorio.existsById(cmd.idComprovante())) {
+            return; // já gravado numa entrega anterior — nada a fazer
+        }
+        repositorio.save(mapear(cmd));
     }
 }
 ```
 
-O `redelivery` é precisamente por que a **idempotência** da Aula 4 é obrigatória: a mesma mensagem **vai** chegar duas vezes em algum cenário de crash, e o consumidor tem que tratar a segunda chegada sem duplicar o comprovante. Ack manual e idempotência são as duas metades da entrega confiável.
+Esse `existsById` resolve o caso comum, mas tem uma janela de corrida: duas entregas concorrentes da mesma mensagem podem **ambas** passar pelo `if` antes de qualquer `save`. Em produção, a defesa robusta não é o `if` — é uma **constraint de unicidade no banco** (`id` como chave primária, ou um índice único na chave de negócio). O banco rejeita a segunda inserção, e o consumidor trata a `DataIntegrityViolationException` como "já gravado".
 
-> Na prática com Spring AMQP, em vez de manipular o `Channel` na mão, você costuma deixar o **container do listener** gerenciar o ack (`AUTO` mode, que faz ack após retorno sem exceção e nack na exceção) e configurar o comportamento de retry/dead-letter por **configuração** — código mais limpo e menos sujeito a erro. O exemplo manual acima existe para você ver o que acontece por baixo.
+A regra mental: **a idempotência confiável mora no armazenamento durável** (constraint), não na verificação em memória. O `existsById` é otimização; a constraint é a garantia.
 
 ---
 
-## 4. Prefetch / QoS: quantas mensagens não-confirmadas por consumidor
+## 6. Backpressure: quando o consumidor não dá conta
 
-Se um consumidor puxa **todas** as mensagens da fila de uma vez para a memória local antes de processá-las, dois problemas surgem: ele pode estourar a própria memória, e o trabalho fica **desbalanceado** — um consumidor "engole" 10 mil mensagens enquanto outro fica ocioso.
+A fila absorve picos — mas ela não é infinita, e o consumidor não é mágico. Quando a taxa de chegada (publicações) supera a taxa de saída (processamento) por tempo suficiente, a fila **cresce sem parar**. Isso é o sinal de **backpressure**: o sistema downstream está dizendo "estou mais lento do que você me alimenta".
 
-O **prefetch count** (configurado via `basic.qos`) limita **quantas mensagens não-confirmadas (in-flight)** o broker entrega a cada consumidor antes de receber o ack delas. É o controle de QoS (Quality of Service) do consumo.
+Cenários no PIX:
+
+- **Consumidor lento:** o banco está degradado; cada gravação leva 2 s em vez de 30 ms. A fila incha durante o pico e drena depois — aceitável se a memória/disco do broker aguentam o pico.
+- **Consumidor caído:** o gravador está fora. A fila cresce **indefinidamente**. Aqui o desacoplamento temporal salva o cliente (a emissão continua respondendo `202`), mas a dívida se acumula no broker.
+
+O que fazer diante do backpressure — em ordem de preferência:
+
+1. **Escalar consumidores horizontalmente:** subir mais instâncias do gravador na mesma fila. É a resposta certa quando o gargalo é o consumidor e o recurso a jusante (o banco) aguenta a concorrência.
+2. **Limitar o que cada consumidor puxa (prefetch/QoS):** evita que um consumidor "engula" milhares de mensagens e estoure a própria memória (detalhe da Aula 6).
+3. **Throttle na entrada / load shedding:** se nem escalando o recurso a jusante aguenta, é melhor **rejeitar na borda** (`503`/`429` na emissão) do que deixar a fila crescer até o broker cair. Falhar rápido e visível supera falhar devagar e invisível.
+4. **Alarmar pela profundidade da fila:** o tamanho da fila é o termômetro mais direto da saúde do sistema. Fila crescendo de forma monotônica = incidente em formação.
+
+> O erro clássico é tratar a fila como "banco infinito" e **não monitorar a profundidade**. A fila cresce silenciosamente, o disco do broker enche, e o que era um problema de latência vira uma queda total — inclusive da emissão, que dependia do broker para publicar.
+
+---
+
+## 7. Exemplo trabalhado: o `POST` do PIX ponta a ponta
+
+Vamos montar o fluxo completo: a emissão responde `202` e publica o comando; o consumidor grava de forma idempotente. Stack: Spring Boot 3 / Spring AMQP / Java 21.
+
+O comando que trafega pela fila — um `record` imutável, com a chave de idempotência embutida:
 
 ```java
-@Bean
-public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
-        ConnectionFactory connectionFactory) {
-    var factory = new SimpleRabbitListenerContainerFactory();
-    factory.setConnectionFactory(connectionFactory);
-    factory.setPrefetchCount(10);   // no máx. 10 mensagens in-flight por consumidor
-    factory.setDefaultRequeueRejected(false); // exceção → dead-letter, não requeue infinito
-    return factory;
+public record GravarComprovanteCommand(
+        UUID idComprovante,   // chave de negócio = chave de idempotência
+        String chavePixDestino,
+        BigDecimal valor,
+        Instant emitidoEm
+) {}
+```
+
+O controller valida, delega e responde `202` **sem esperar a gravação**:
+
+```java
+@RestController
+@RequestMapping("/comprovantes")
+public class EmissaoController {
+
+    private final EmissorDeComprovante emissor;
+
+    public EmissaoController(EmissorDeComprovante emissor) {
+        this.emissor = emissor;
+    }
+
+    @PostMapping
+    public ResponseEntity<EmissaoResponse> emitir(@RequestBody @Valid EmissaoRequest req) {
+        UUID id = emissor.aceitarEPublicar(req); // valida + publica o comando
+        return ResponseEntity
+                .accepted() // 202: "recebi, vou processar"
+                .body(new EmissaoResponse(id, "PROCESSANDO"));
+    }
 }
 ```
 
-A heurística de tuning:
-
-- **Prefetch baixo (1–10):** melhor **balanceamento** entre consumidores e menor risco de uma instância acumular trabalho que não vai dar conta. Ideal para tarefas pesadas e demoradas, como a gravação que depende do banco.
-- **Prefetch alto (centenas):** melhor **throughput** quando cada mensagem é leve e rápida, porque reduz o ida-e-volta de pedir mais mensagens. Pior balanceamento.
-
-Para a gravação do PIX (tarefa de IO, latência variável), um prefetch baixo é o ponto de partida sensato: você prefere que mensagens sobrem na fila (visíveis, escaláveis) a que sobrem acumuladas dentro de um consumidor (invisíveis, perdidas se ele cai). Prefetch também é uma das alavancas de **backpressure** da Aula 4: limitar o in-flight evita que o consumidor afogue o banco a jusante.
-
----
-
-## 5. Retry com backoff: a resposta à falha transitória
-
-Para a falha **transitória**, a estratégia é tentar de novo — mas **não imediatamente nem para sempre**. Tentar de novo na mesma fração de segundo, contra um banco que acabou de cair, é um *retry storm*: você martela um recurso já sofrendo e prolonga o incidente (assunto da Aula 7).
-
-A combinação certa é **retry com backoff exponencial e limite**:
-
-- **Backoff exponencial:** espaça as tentativas crescentemente — 1 s, 2 s, 4 s, 8 s — dando ao recurso a jusante tempo para se recuperar.
-- **Limite de tentativas:** depois de N tentativas (ex.: 3 a 5), você **para**. Se ainda falha, ou o problema não era transitório, ou está durando demais para reprocessar in-line — em ambos os casos, a mensagem vai para a DLQ.
-
-Com Spring AMQP isso se configura declarativamente, sem poluir o listener:
+O emissor **gera o id**, valida de forma síncrona e publica numa exchange (a anatomia da exchange é a Aula 6; aqui foco no padrão produtor):
 
 ```java
-@Bean
-public RetryOperationsInterceptor retryInterceptor() {
-    return RetryInterceptorBuilder.stateless()
-            .maxAttempts(4)                                  // 1 original + 3 retries
-            .backOffOptions(1000, 2.0, 10000)               // 1s, 2s, 4s... teto 10s
-            .recoverer(new RejectAndDontRequeueRecoverer()) // esgotou → dead-letter
-            .build();
+@Service
+public class EmissorDeComprovante {
+
+    private final RabbitTemplate rabbit;
+
+    public EmissorDeComprovante(RabbitTemplate rabbit) {
+        this.rabbit = rabbit;
+    }
+
+    public UUID aceitarEPublicar(EmissaoRequest req) {
+        validarRegrasDeNegocio(req);  // síncrono e rápido: VOs, formato, limites
+        UUID id = UUID.randomUUID();   // identidade gerada AQUI, na aceitação
+
+        rabbit.convertAndSend(
+                "comprovantes.exchange",  // exchange (não a fila diretamente)
+                "comprovante.gravar",     // routing key = a intenção
+                new GravarComprovanteCommand(id, req.chavePixDestino(), req.valor(), Instant.now()));
+
+        return id; // devolvido no 202, para o cliente consultar depois
+    }
 }
 ```
 
-O `RejectAndDontRequeueRecoverer` é a peça que liga o retry à DLQ: quando as tentativas se esgotam, ele faz `nack` com `requeue=false`, e **aí** o mecanismo de dead-lettering entra em ação. Sem ele, o default seria requeue infinito — o loop da poison message.
-
----
-
-## 6. Dead Letter Queue: o destino da falha permanente
-
-A **Dead Letter Queue (DLQ)** é uma fila lateral para onde uma mensagem é desviada quando **não pode ser entregue/processada normalmente**. O ponto inegociável: a mensagem é **preservada para inspeção**, **nunca descartada em silêncio**. Uma mensagem que "some" sem rastro é um comprovante perdido e um bug invisível; a DLQ existe para que isso jamais aconteça por acidente.
-
-Uma mensagem é "dead-lettered" (enviada à DLQ) em três situações:
-
-1. O consumidor faz `nack`/`reject` com `requeue=false` (nosso caso de mensagem inválida ou retry esgotado).
-2. A mensagem **expira** (TTL estourado) sem ser consumida.
-3. A fila atinge o **limite de tamanho** (`max-length`) e descarta a mais antiga para a DLQ.
-
-O roteamento para a DLQ não é mágico: é o **mesmo** mecanismo de exchange/binding da seção 2. A fila principal declara, nos seus argumentos, uma **dead-letter-exchange** para onde mandar os mortos:
-
-```java
-@Bean
-public Queue gravacaoQueue() {
-    return QueueBuilder.durable("comprovante.gravar.q")
-            .withArgument("x-dead-letter-exchange", "comprovante.dlx")    // para onde mandar
-            .withArgument("x-dead-letter-routing-key", "comprovante.morto") // com que rótulo
-            .build();
-}
-
-@Bean
-public Queue dlq() {
-    return QueueBuilder.durable("comprovante.gravar.dlq").build(); // a fila dos mortos
-}
-
-@Bean
-public DirectExchange deadLetterExchange() {
-    return new DirectExchange("comprovante.dlx");
-}
-
-@Bean
-public Binding dlqBinding() {
-    return BindingBuilder.bind(dlq())
-            .to(deadLetterExchange())
-            .with("comprovante.morto"); // rota da DLX até a DLQ
-}
-```
-
-Os argumentos `x-dead-letter-*` são o contrato: `x-dead-letter-exchange` diz **para qual exchange** a mensagem morta vai, e `x-dead-letter-routing-key` (opcional) **reescreve a routing key** para que a DLX a entregue na DLQ certa. A mensagem chega na DLQ com **headers de diagnóstico** (`x-death`) que registram **quantas vezes** ela morreu, **de qual fila** e **por quê** — material de ouro para o time investigar o bug que a causou.
-
-> A DLQ não é uma lixeira; é uma **sala de necropsia**. Toda mensagem ali é um incidente a ser entendido: ou um bug de dados a corrigir, ou uma incompatibilidade de versão, ou um cenário que o código não previu. O fluxo operacional maduro inclui **alarmar quando a DLQ cresce** e, muitas vezes, um processo de **reprocessamento** após corrigir a causa.
-
----
-
-## 7. Poison message e ordenação
-
-A **poison message (mensagem envenenada)** é a mensagem que **falha permanentemente** mas o sistema insiste em reprocessar. Sem retry limitado + DLQ, ela vira um loop infinito: o consumidor pega, falha, devolve à fila (requeue), pega de novo, falha de novo — consumindo CPU, gerando log infinito e, pior, **bloqueando** as mensagens boas atrás dela. Uma única mensagem malformada pode parar toda a gravação de comprovantes.
-
-A defesa é exatamente a arquitetura que montamos: **limite de tentativas** (a poison não fica eternamente) + **DLQ** (ela sai do caminho das mensagens boas, mas não se perde). É por isso que "retry sem limite" e "consumidor sem DLQ" são, juntos, a receita do desastre.
-
-Sobre **ordenação**: o RabbitMQ garante ordem **FIFO dentro de uma única fila com um único consumidor**. Assim que você adiciona **múltiplos consumidores** (para escalar) ou **retry/redelivery** (uma mensagem que falha e volta entra atrás das que chegaram depois), a ordem **deixa de ser garantida**. Para a gravação de comprovantes isso é aceitável — cada comprovante é independente, identificado pelo seu `id`, e a idempotência cuida das duplicatas. Mas é um trade-off a declarar: **se o seu domínio exige ordem estrita, escala horizontal e fila simples não convivem** — você precisaria de particionamento por chave (terreno do Kafka, próxima aula).
-
----
-
-## 8. Exemplo trabalhado: provar a DLQ com uma mensagem envenenada
-
-Montar a topologia é metade do trabalho; **provar** que ela funciona é a outra. O objetivo: injetar uma mensagem que falha sempre e **demonstrar** que ela acaba na DLQ — sem travar a fila e sem se perder.
-
-O consumidor, que distingue os dois tipos de falha:
+O consumidor, idempotente, do outro lado da fila:
 
 ```java
 @Component
@@ -212,59 +207,63 @@ public class GravacaoListener {
 
     @RabbitListener(queues = "comprovante.gravar.q")
     public void aoReceber(GravarComprovanteCommand cmd) {
-        if (cmd.valor() == null || cmd.idComprovante() == null) {
-            // falha PERMANENTE: nenhum retry vai consertar isto
-            throw new AmqpRejectAndDontRequeueException("comprovante malformado");
-        }
         if (repositorio.existsById(cmd.idComprovante())) {
-            return; // idempotência sob redelivery
+            return; // mensagem reentregue (at-least-once): ignora com segurança
         }
-        repositorio.save(mapear(cmd)); // pode lançar falha TRANSITÓRIA (banco) → retry
+        repositorio.save(mapear(cmd));
+    }
+
+    private Comprovante mapear(GravarComprovanteCommand cmd) {
+        return new Comprovante(cmd.idComprovante(), cmd.chavePixDestino(),
+                               cmd.valor(), cmd.emitidoEm());
     }
 }
 ```
 
-A distinção está nos dois caminhos de exceção:
+O que esse fluxo entrega: a emissão responde em milissegundos mesmo com o banco degradado; o pico vira fila, não timeout; e a duplicata inevitável do at-least-once é absorvida pela idempotência. O que **ainda falta** — o que acontece quando a gravação falha 3 vezes seguidas, ou quando a mensagem está malformada e nunca vai gravar — é o gancho da Aula 6.
 
-- `AmqpRejectAndDontRequeueException` sinaliza ao Spring AMQP "**não** tente de novo" → a mensagem vai **direto** para a DLQ. É a resposta à falha permanente, sem desperdiçar tentativas.
-- Qualquer outra exceção (ex.: `DataAccessException` do banco oscilando) passa pelo **retry com backoff** da seção 5; só vai para a DLQ se as 4 tentativas se esgotarem.
+---
 
-**O roteiro do experimento** (o que você fará no studio):
+## 8. Quando **não** usar assíncrono
 
-1. Publique um `GravarComprovanteCommand` **válido** → confirme que grava normalmente e dá ack.
-2. Publique um comando com `valor` nulo → observe que ele **não** fica em loop; vai **imediatamente** para `comprovante.gravar.dlq`.
-3. Abra a fila `comprovante.gravar.dlq` no **painel de management** do RabbitMQ → veja a mensagem **preservada**, com os headers `x-death` mostrando a origem e o motivo.
-4. Publique outro comando **válido** logo depois do envenenado → confirme que ele **passa na frente**: a poison message **não bloqueou** a fila.
+Assíncrono é uma ferramenta, não uma medalha. Ele adiciona um broker para operar, duplicação para tratar, ordenação para pensar e uma classe inteira de bugs ("a mensagem sumiu?") para depurar. Pagar esse preço sem necessidade é dívida técnica disfarçada de arquitetura moderna.
 
-Os passos 2 e 4 juntos são a prova que importa: a falha permanente foi **isolada** (não travou) e **preservada** (não sumiu). Essa é a definição operacional de "mensagem nunca some por acidente — ou foi processada, ou está numa DLQ por decisão".
+Mantenha **síncrono** quando:
+
+- **A resposta precisa do resultado para continuar.** Se o cliente não pode prosseguir sem o dado processado (ex.: autorizar uma transação e devolver "aprovado/negado" na hora), o assíncrono só adiciona um round-trip de consulta.
+- **O trabalho é rápido e estável.** Se a operação leva 10 ms e quase nunca falha, a fila não compra nada — só adiciona latência e infraestrutura.
+- **A consistência forte imediata é requisito.** Se a regra exige que o efeito seja visível atomicamente (a invariante de um agregado, Aula 1), processar depois quebra a garantia.
+- **O volume não justifica.** Sem pico, sem instabilidade a jusante e sem fan-out, você está construindo um caminhão para carregar um envelope.
+
+> A pergunta de triagem: *"o cliente precisa do resultado para a próxima ação dele?"* Se **sim**, comece síncrono. Se **não** — e há latência, instabilidade ou pico no caminho — o assíncrono se paga.
 
 ---
 
 ## 9. Ponte com o legado Caixa
 
-Quem operou processamento **batch** no mainframe já conhece a DLQ por outro nome: a **"fila de exceção"**, o **"arquivo de rejeitados"**, o dataset de registros que o job não conseguiu processar e separou para tratamento posterior. O conceito é idêntico — não descartar o que falhou, separá-lo para análise — e a maturidade operacional de "todo dia alguém olha os rejeitados" é exatamente a cultura que a DLQ moderna exige.
+Quem operou **IBM MQ (MQSeries) com JMS** já fez producer/consumer décadas atrás — e fez bem. As filas de entrada e saída do mainframe, os processos batch que liam de uma fila e escreviam em outra, o desacoplamento entre o CICS que aceitava e o job noturno que processava: tudo isso **é** comunicação assíncrona. O conceito de "aceitar agora, processar depois" nasceu no mundo dos grandes processadores transacionais, não na nuvem.
 
-O que mudou é que a DLQ hoje é **explícita, observável e instrumentada**: em vez de um arquivo perdido num diretório que alguém *talvez* abra, é uma fila com **métrica de profundidade**, **alarme** quando cresce, e **headers de diagnóstico** (`x-death`) que contam a história da falha. O retry com backoff, da mesma forma, é a versão observável do velho "tenta de novo no próximo ciclo do batch" — agora com política configurável e por mensagem, não por job inteiro. O veterano de batch entende essa aula mais rápido que ninguém: ele já viveu o que acontece quando um único registro envenenado derruba o processamento da madrugada inteira.
+O que mudou não é o conceito — é o **ferramental e o ecossistema**. O broker hoje é RabbitMQ ou Kafka em vez de MQSeries; a observabilidade é métrica de profundidade de fila em painel em vez de relatório de fila; a escala é horizontal e elástica em vez de capacidade fixa. Mas a garantia de entrega, a deduplicação por chave (o veterano de batch já chamava de "controle de reprocessamento") e a fila de rejeitados (a futura DLQ) são velhos conhecidos. Nesta aula, quem vem do legado costuma ser quem mais rápido entende o **porquê** — aproveite para liderar a explicação.
 
 ---
 
 ## 10. IA & agentes hoje
 
-A topologia de filas + DLQ é, hoje, infraestrutura padrão de pipelines de IA — pelas mesmas razões que no comprovante PIX, com o LLM no lugar do banco instável.
+A mesma disciplina de desacoplamento governa os sistemas de IA modernos — e por uma razão idêntica: a parte cara e instável não pode ficar no caminho síncrono.
 
-- **Work queue para jobs de IA com rate limit:** vários workers consomem chamadas de LLM em paralelo, e a **fila vira o regulador de vazão**. O provedor de modelo impõe um limite de requisições por minuto; controlar o **prefetch** e o número de workers é como você respeita esse limite sem estourar `429` — a fila absorve o excesso em vez de rejeitá-lo.
-- **Backpressure quando o LLM é o gargalo:** quando a inferência é mais lenta que a chegada de tarefas, a fila cresce. Esse é o **sinal de saúde** mais direto: profundidade subindo = escalar workers ou throttlar a entrada, exatamente como na gravação do PIX. Monitorar a fila do agente é monitorar o agente.
-- **DLQ para chamadas de IA que falham:** um timeout, um conteúdo recusado pelo provedor, uma resposta que não casa com o schema esperado — são as *poison messages* do mundo de IA. Em vez de reprocessar para sempre (queimando dinheiro a cada tentativa contra um LLM) ou descartar em silêncio (perdendo a tarefa do usuário), a chamada falha vai para uma **DLQ** e entra em **inspeção humana**. A distinção transitório × permanente é a mesma: um `503` momentâneo do provedor merece retry com backoff; um prompt que sempre viola a política de conteúdo é falha permanente que precisa de gente olhando.
+- **Desacoplar inferência cara:** uma chamada de LLM leva segundos, custa dinheiro por token e falha de formas variadas (timeout, rate limit, conteúdo recusado). Colocá-la no caminho síncrono de uma request HTTP é repetir o erro da gravação do PIX. O padrão certo é o mesmo: aceitar a tarefa, responder `202`, publicar numa fila e deixar **workers** processarem. O cliente consulta o resultado depois (polling ou webhook).
+- **Filas de tarefas de agentes:** um orquestrador publica tarefas (`PesquisarDocumentoTask`, `GerarResumoTask`); agentes-worker consomem da fila, escalam horizontalmente conforme a carga e **isolam falhas** — um worker que trava não derruba o orquestrador. É producer/consumer com o LLM no lugar do banco.
+- **Human-in-the-loop assíncrono:** um passo que exige aprovação humana ("este agente quer executar uma transação de R$ 50 mil — aprovar?") é, por natureza, assíncrono: o agente publica o pedido, **suspende** aquele fluxo e retoma quando a resposta humana chega — minutos ou horas depois. Tentar fazer isso síncrono é segurar uma thread esperando um humano, o pior dos mundos.
 
-Tudo o que você configurou aqui — exchange, binding, ack manual, prefetch, retry com backoff, DLQ — é transferível, sem adaptação conceitual, para orquestrar agentes em produção.
+A intuição transfere direto: o que você aprendeu sobre `202`, idempotência e backpressure no comprovante PIX é exatamente o que se aplica a um pipeline de agentes em produção.
 
 ---
 
 ## 11. Para ir além
 
-- **RabbitMQ Tutorials** — especialmente *Work Queues*, *Routing*, *Topics* e *Dead Letter Exchanges* (a documentação oficial, com exemplos executáveis).
-- **Spring AMQP Reference** — *Message Listener Container*, *Retry*, *Dead Letter* e configuração de `x-dead-letter-*` por `QueueBuilder`.
-- **Gregor Hohpe & Bobby Woolf**, *Enterprise Integration Patterns* — *Dead Letter Channel* e *Invalid Message Channel* (os padrões que a DLQ implementa).
-- **RabbitMQ in Depth** (Gavin M. Roy) — para entender o protocolo AMQP por baixo das abstrações do Spring.
+- **Gregor Hohpe & Bobby Woolf**, *Enterprise Integration Patterns* — a bíblia dos padrões de mensageria (Message, Command Message, Event Message, Idempotent Receiver).
+- **Tyler Treat**, *"You Cannot Have Exactly-Once Delivery"* — o artigo que desmonta o mito com o raciocínio completo de falha.
+- **Spring AMQP Reference** — conceitos de `RabbitTemplate`, `@RabbitListener` e conversão de mensagens.
+- **Sam Newman**, *Building Microservices* (cap. de comunicação) — quando preferir orquestração síncrona vs. coreografia assíncrona.
 
-> **Na próxima aula:** a fila de gravação resolve **um comando para um destino**. Mas o event storming da Aula 1 deixou uma política em aberto: *"sempre que um comprovante é gravado, notificar o cliente, avisar o antifraude e alimentar o BI"*. São **três** interessados no **mesmo** fato, e o gravador não deve nem saber que eles existem. Filas ponto-a-ponto não modelam isso bem — é a entrada de **tópicos e publish/subscribe**, e de um broker pensado para fan-out e replay em escala: o **Kafka**.
+> **Na próxima aula (Aula 6 — RabbitMQ + DLQ):** o consumidor desta aula tem um buraco. Quando a gravação falha por **azar momentâneo** (banco oscilou), reprocessar resolve. Mas quando a mensagem está **malformada** e vai falhar **sempre**, reprocessar para sempre trava a fila inteira — é a *poison message*. Como distinguir os dois tipos de falha, reprocessar um com **retry e backoff** e isolar o outro numa **Dead Letter Queue** sem nunca perder o dado? É a entrada do RabbitMQ de verdade: exchanges, bindings, ack manual, prefetch e DLQ.

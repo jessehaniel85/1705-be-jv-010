@@ -1,244 +1,350 @@
-# Material do Aluno — Aula 3: Cache com Redis (e semantic caching)
+# Material do Aluno — Aula 3: Comunicação entre microsserviços (o panorama)
 
-> **Tempo de leitura:** ~12 min. A consulta de comprovante é a operação mais frequente do sistema — todo cliente quer ver o comprovante, repetidas vezes, logo após o PIX. Cada consulta hoje vai ao banco, a fonte da verdade que o gravador protege. No pico, isso é o banco apanhando de milhões de leituras idênticas. Cache é a resposta — mas cache é uma faca de dois gumes: o cache certo economiza banco e dinheiro; o cache errado serve dado velho e gera o bug mais difícil de reproduzir do seu sistema. Esta aula é sobre fazer o primeiro e evitar o segundo, com consciência dos trade-offs.
-
----
-
-## 1. Por que cachear (e por que não é grátis)
-
-Três motivos, em ordem de impacto:
-
-- **Latência.** Uma leitura do banco atravessa pool de conexão, rede, parser de SQL, índice e disco. Uma leitura de cache em memória é ordens de magnitude mais rápida. Para o cliente, é a diferença entre o comprovante "aparecer na hora" e "demorar".
-- **Alívio do banco.** A fonte da verdade é o recurso mais caro de escalar (escalar banco relacional horizontalmente é difícil e caro). Cada *hit* no cache é uma query que **não** chegou ao banco. No pico, é a diferença entre o banco respirar e o banco cair.
-- **Custo.** Capacidade de banco custa caro; capacidade de cache é barata. Servir leitura quente de cache é, literalmente, mais barato por requisição.
-
-Mas cache **não é grátis**. Você introduz uma **segunda cópia da verdade**, e duas cópias podem divergir. A engenharia de cache é, no fundo, uma única decisão repetida: **o que pode estar um pouco velho — e por quanto tempo?** Se a resposta para algum dado é "nada pode estar velho, nunca", esse dado não deveria ser cacheado. Para o comprovante já gravado — que é **imutável** depois de gravado — a resposta é "pode estar velho à vontade, ele não muda", e isso o torna um candidato quase perfeito.
+> **Tempo de leitura:** ~13 min. Na Aula 2 você quebrou um fluxo de negócio em serviços com bases próprias e viu que manter o dado correto virou responsabilidade sua (SAGA, compensação, idempotência). Ficou no ar a pergunta certa: **e como esses serviços conversam, afinal?** Esta aula é o mapa dessa conversa. Não é sobre uma ferramenta — é sobre os **três eixos de decisão** que toda comunicação distribuída atravessa, e sobre onde encaixam nomes que apareceram na turma: **Apache Camel**, **service bus / ESB**, **arquitetura orientada a eventos**. No fim, você vai conseguir ouvir "a gente usa um barramento" ou "isso é coreografia" e saber exatamente de que camada a pessoa está falando.
 
 ---
 
-## 2. Cache local × distribuído: por que Redis e não um `HashMap`
+## 1. O problema gerador: três perguntas que viraram uma só
 
-A tentação do iniciante é guardar num `HashMap` (ou Caffeine) dentro do processo. É rápido e zero-infra. E quebra assim que você tem **mais de uma instância** — que é o caso de qualquer sistema sério na nuvem, com várias réplicas atrás de um load balancer.
+Depois da SAGA, as dúvidas da turma convergiram para variações da mesma pergunta:
 
-| Aspecto | Cache local (HashMap/Caffeine) | Cache distribuído (Redis) |
+- *"Os serviços se chamam por HTTP ou jogam mensagem numa fila?"*
+- *"Um colega usava Apache Camel; outro falou em service bus — isso é a mesma coisa que fila?"*
+- *"Quando o erro acontece, quem decide o que fazer? Tem um chefe ou cada um se vira?"*
+
+Parecem três perguntas. São **três eixos independentes** da mesma decisão, e a confusão quase sempre nasce de tratá-los como um só. Vamos separá-los:
+
+1. **O acoplamento temporal** — síncrono ou assíncrono? (§2)
+2. **A intenção da mensagem** — comando ou evento? (§3)
+3. **Quem coordena o fluxo** — orquestração ou coreografia? (§4)
+
+E há uma quarta coisa, que **não é um eixo de decisão de arquitetura**, mas de **ferramental**: como a mensagem fisicamente trafega, é roteada e transformada — é aí que entram **broker, ESB, service bus e Apache Camel** (§6). Misturar essa camada com as três decisões acima é o erro nº 1. Um "barramento" não decide se você usa evento ou comando; ele só transporta.
+
+> A regra que organiza a aula inteira: **EDA é o meio, orquestração/coreografia é quem manda no fluxo, e Camel/ESB é como a mensagem anda.** São perguntas diferentes, com respostas independentes.
+
+---
+
+## 2. Eixo 1 — Síncrono × assíncrono (o acoplamento temporal)
+
+A primeira decisão é se o emissor **espera** a resposta.
+
+- **Síncrono (request/response):** o serviço A chama B e **bloqueia** até B responder. REST sobre HTTP, gRPC, GraphQL. Simples de raciocinar — parece uma chamada de método. O preço: **acoplamento de disponibilidade** (se B caiu, A falha) e **acoplamento de latência** (A paga o tempo de B).
+- **Assíncrono (mensageria):** A entrega a mensagem a um **intermediário durável** e segue a vida; B processa quando puder. Desacopla disponibilidade e latência — ao custo de um broker para operar e de uma classe nova de problemas (duplicação, ordem, "a mensagem sumiu?").
+
+| Dimensão | Síncrono (HTTP/gRPC) | Assíncrono (mensageria) |
 |---|---|---|
-| Latência | Menor (mesma JVM, sem rede) | Baixa, mas paga um *hop* de rede |
-| Compartilhado entre réplicas | **Não** — cada nó tem sua visão | **Sim** — visão única |
-| Sobrevive ao restart do nó | Não (morre com o processo) | Sim (estado fora do nó) |
-| Invalidação consistente | Difícil (invalida só num nó) | Simples (uma chave, todos veem) |
-| Estado preso ao nó | Sim (impede escala fácil) | Não (nó vira *stateless*) |
+| O emissor espera? | Sim, bloqueia | Não, dispara e segue |
+| Acoplamento de disponibilidade | Alto (caem juntos) | Baixo (o broker absorve) |
+| Latência vista pelo cliente | Soma de todo o trabalho | Só validação + publicação |
+| Absorção de pico | Nenhuma | A fila é o buffer natural |
+| Complexidade operacional | Baixa | Alta (broker, dedup, DLQ) |
+| Quando preferir | A resposta é necessária **já** para continuar | Trabalho lento/instável, picos, fan-out |
 
-Os dois problemas do cache local são fatais em ambiente replicado:
+A pergunta de triagem é a mesma da Aula 5: **"o chamador precisa do resultado para a próxima ação dele?"** Se sim, comece síncrono. Se não — e há latência, instabilidade ou pico no caminho — o assíncrono se paga. Não é "moderno × antigo": um sistema real usa **os dois**, cada um onde dói menos.
 
-- **Visões divergentes.** A instância A cacheou o comprovante; a instância B nunca o viu. O cliente, atrás do load balancer, vê respostas diferentes dependendo de qual nó atendeu. Pior: invalidar na instância A **não afeta** a B — a B segue servindo o dado velho.
-- **Estado preso ao nó.** Guardar estado dentro do processo te força a *sticky session* (prender o cliente a um nó), o que **mata a escala horizontal** — você não pode simplesmente adicionar/remover nós livremente.
-
-Redis resolve os dois: é um cache **fora do processo**, **compartilhado** por todas as réplicas. Ele tira o estado do nó (adeus *sticky session*), o que é **pré-requisito** para escalar horizontalmente — exatamente o que a consulta de comprovante precisa no pico.
+> Erro clássico do júnior empolgado: tornar **tudo** assíncrono porque "microsserviço de verdade é por evento". Consultar o saldo para autorizar um PIX **tem** que ser síncrono — o cliente não pode receber `202 Aceito, te aviso depois se tinha saldo`.
 
 ---
 
-## 3. Estratégias de cache: saiba escolher, não decore
+## 3. Eixo 2 — Comando × evento (a intenção)
 
-Cache não é uma coisa só; é um conjunto de estratégias com trade-offs distintos. Conheça as quatro e saiba **quando** usar cada uma.
+Dentro do mundo assíncrono, **toda mensagem é uma de duas coisas** — e confundi-las recria o acoplamento que a fila deveria quebrar. (Esta é a espinha da Aula 5; aqui fica o resumo que organiza o panorama.)
 
-- **Cache-aside (lazy loading).** A aplicação é responsável pelo cache: consulta o cache; no *miss*, vai ao banco, **popula** o cache e retorna. O cache só guarda o que foi pedido (carrega "preguiçosamente"). É a estratégia mais comum, e a do nosso projeto PIX. **Vantagem:** simples, resiliente (se o Redis cai, você ainda lê do banco). **Custo:** o primeiro acesso a cada chave é sempre um *miss* (cache "frio").
+- **Comando** — *"faça isto"*. Dirigido a **um** dono lógico, no imperativo: `GravarComprovanteCommand`. O emissor **espera** que a ação aconteça e sabe que pediu.
+- **Evento** — *"isto aconteceu"*. Um fato no passado, no particípio: `ComprovanteGravadoEvent`. O emissor **não sabe nem se importa** com quem reage — pode ser zero, um ou dez consumidores.
 
-- **Read-through.** Parecido com cache-aside, mas é o **provedor de cache** quem busca no banco no *miss*, não a aplicação. A aplicação só fala com o cache. **Vantagem:** lógica de carga centralizada. **Custo:** acopla você à biblioteca de cache.
+> A regra prática: **se você consegue adicionar um novo consumidor sem tocar no produtor, é um evento. Se o produtor precisaria saber que o consumidor existe, é um comando.**
 
-- **Write-through.** Na escrita, grava no cache **e** no banco, sincronamente, juntos. **Vantagem:** o cache está sempre quente e consistente com o banco — leituras nunca pegam dado velho. **Custo:** escrita mais lenta (paga as duas gravações) e cacheia dado que talvez nunca seja lido.
+Esse eixo é o que liga este panorama de volta à SAGA da Aula 2: a compensação coreografada que você discutiu — *"deu erro, publica um evento, cada um reage"* — é exatamente **eventos** disparando reações. Já a orquestração tende a usar **comandos** (o maestro manda cada serviço agir). Guarde isso para o §4.
 
-- **Write-behind (write-back).** Grava no cache e persiste no banco **depois**, de forma assíncrona. **Vantagem:** escrita rapidíssima, absorve picos de escrita. **Custo:** **risco de perda** — se o cache cai antes de persistir, o dado se foi. Inaceitável para a fonte da verdade de um comprovante; aceitável para métricas/contadores onde perder um pouco não dói.
+---
 
-Heurística: **cache-aside para o caso de leitura pesada e escrita rara** (o comprovante imutável); **write-through quando consistência de leitura é crítica e a escrita aguenta o custo**; **write-behind só para dados toleráveis a perda**.
+## 4. Eixo 3 — Orquestração × coreografia (quem coordena)
 
-### Em código, com Spring Cache
+Este é o eixo que gerou a sua resposta em aula — e o que mais merece precisão, porque o custo da coreografia é fácil de subestimar.
+
+### Orquestração — um maestro central
+Um componente conhece o fluxo inteiro e **comanda** cada passo (tipicamente via **comandos**), decidindo a cada resposta se avança ou compensa. O fluxo de negócio mora **num lugar só**.
+
+- **Ganho:** observabilidade alta (leia o estado da saga num lugar), fácil de depurar e provar correto.
+- **Custo:** o maestro é um componente crítico e todos o conhecem (mais acoplamento a ele). *(O quanto isso é mesmo um SPOF — e como um pool de orquestradores realoca o problema em vez de eliminá-lo — foi a discussão da Aula 2.)*
+
+### Coreografia — sem maestro, por eventos
+Ninguém comanda. Cada serviço **reage** a um evento e **emite** o seu. A emissão publica `ComprovanteAceito`; o gravador escuta, grava, publica `ComprovanteGravado`; se falha, publica `GravacaoFalhou`, e quem se importa reage — inclusive disparando uma **ação compensatória**.
+
+- **Ganho:** desacoplamento máximo. Adicionar um novo reator (antifraude, BI) é só assinar o evento — o produtor nem fica sabendo.
+- **Custo honesto — e é simétrico ao SPOF do maestro:** o fluxo fica **espalhado**. Não existe lugar para "ler a saga inteira"; entender e depurar exige **reconstruir mentalmente a cadeia de eventos**. Surgem três armadilhas específicas:
+  - **Opacidade:** "em que passo a saga travou?" não tem resposta num só log. Você precisa de **correlation id** atravessando os serviços para reconstruir.
+  - **Cadeias cíclicas:** A reage a um evento de B emitindo um evento que dispara B de novo — laços emergentes difíceis de prever.
+  - **"Terminou?":** ninguém sabe sozinho se a saga concluiu ou ficou órfã. Precisa de timeout/sweeper externo.
+
+| Critério | Orquestração | Coreografia |
+|---|---|---|
+| Onde mora o fluxo | Centralizado (maestro) | Distribuído (nos eventos) |
+| Mensagem típica | Comando | Evento |
+| Observabilidade | Alta | Baixa (precisa correlacionar) |
+| Acoplamento | Maior (todos conhecem o maestro) | Menor (só conhecem eventos) |
+| Risisco focal | Maestro é crítico | Cadeia opaca / cíclica |
+| Quando preferir | Fluxo com decisão complexa; **caminho crítico auditável** | Fluxo linear; **muitos reatores** |
+
+**A correção que vale para o contexto Caixa.** Dizer que "coreografia é muito comum" precisa de asterisco em domínio bancário regulado: o **caminho crítico do dinheiro** (uma saga de pagamento) costuma ser **orquestrado de propósito** — você quer um estado de transação auditável e observável num lugar só. A **coreografia brilha na periferia reativa**: notificação, antifraude e BI reagindo a `ComprovanteGravado`. A resposta madura é **mistura**: orquestre o núcleo, coreografe os reatores. A heurística da Aula 2 continua valendo — **comece orquestrado** (mais fácil de provar correto) e migre passos para coreografia conforme o desacoplamento justifique o custo de opacidade.
+
+---
+
+## 5. Arquitetura orientada a eventos (EDA) — o estilo, não a estratégia
+
+Quando a coreografia deixa de ser "um truque numa saga" e vira o **estilo dominante** do sistema — serviços se integram primariamente publicando e consumindo eventos — você está fazendo **arquitetura orientada a eventos (EDA)**.
+
+O ponto que desfaz a confusão mais comum: **EDA é o meio (o sistema conversa por eventos); coreografia é uma forma de usar esse meio para coordenar um fluxo.** Você pode ter EDA **e** orquestração ao mesmo tempo — um orquestrador que consome e emite eventos é perfeitamente EDA. Não são sinônimos.
+
+EDA tende a aparecer em três sabores, em complexidade crescente:
+
+- **Notificação por evento:** o evento avisa "algo aconteceu", carregando só o id; o interessado vai buscar o resto. Acoplamento mínimo, mas gera chamadas de volta.
+- **Transferência de estado por evento (event-carried state):** o evento carrega os dados de que o consumidor precisa, evitando o callback. Mais autonomia, ao custo de duplicar dados.
+- **Event sourcing:** o estado do sistema **é** a sequência de eventos (a "memória" é o log). Poderoso e auditável — combina com o domínio bancário —, mas é um salto de complexidade. Fica para a Aula 7 (Kafka), onde o log de eventos é cidadão de primeira classe.
+
+> Para guardar: notificação e fan-out reativo cabem em **filas/tópicos** comuns (Aulas 6–7). Event sourcing é EDA "levada a sério" — não comece por ele.
+
+---
+
+## 6. A camada de integração: broker, ESB, service bus e Apache Camel
+
+Aqui mora a pergunta que os colegas trouxeram. **Nada nesta seção decide os três eixos acima** — é tudo sobre **como a mensagem fisicamente anda, é roteada e transformada**. Vamos do mais simples ao mais "esperto".
+
+### Broker (o transporte durável)
+Um **broker** guarda a mensagem de forma durável até alguém consumir: RabbitMQ, Kafka, IBM MQ, **Azure Service Bus**. É "burro" no bom sentido — ele transporta e entrega; a inteligência de negócio fica **nos serviços**. Esse é o modelo que o resto do módulo usa (Aulas 5–7).
+
+> **Sobre "Azure Service Bus" especificamente** (alvo de nuvem da Caixa): apesar do nome "bus", ele é um **broker gerenciado** — filas e tópicos como serviço. É saudável e moderno; **não** é um ESB pesado. Quando alguém na Caixa disser "vamos no Service Bus", quase sempre é isto: um broker na nuvem, equivalente em papel ao RabbitMQ/Kafka que veremos.
+
+### ESB (Enterprise Service Bus) — o barramento "esperto"
+O **ESB clássico** é um barramento **central** que faz muito mais que transportar: roteamento por conteúdo, transformação de formatos, orquestração, adaptação de protocolos — tudo num componente central de mediação (TIBCO, Oracle ESB, IBM Integration Bus). Foi o padrão corporativo dos anos 2000 — e é provavelmente o que a turma viveu no legado da Caixa.
+
+**Por que o movimento de microsserviços reagiu contra o ESB.** Martin Fowler resumiu na frase **"smart endpoints and dumb pipes"** (endpoints espertos, canos burros): a inteligência deve viver **nos serviços**, e o transporte deve ser **simples**. O ESB centraliza a esperteza num só lugar, e isso traz dois problemas que microsserviços tentam evitar: ele vira **SPOF** (cai o barramento, cai a integração toda) e **gargalo de deploy** (toda mudança de roteamento passa por um time central). O ESB não é "errado" — é uma escolha que troca autonomia de times por governança central. Microsserviços fazem a troca oposta.
+
+### Apache Camel — EIP como biblioteca
+**Apache Camel** é um *toolkit* de **Enterprise Integration Patterns** (os padrões do livro de Hohpe & Woolf): roteamento, *content-based router*, *splitter/aggregator*, transformação, com **300+ conectores** (HTTP, JMS, Kafka, FTP, e-mail, S3...). A mecânica central é a **rota**:
 
 ```java
-@Service
-public class ConsultaComprovanteService {
+// Apache Camel: uma rota = receba daqui, transforme, mande para lá.
+// "Comprovante chega numa fila AMQP, normaliza, roteia por valor."
+from("amqp:queue:comprovantes.entrada")
+    .unmarshal().json(Comprovante.class)
+    .choice()
+        .when(simple("${body.valor} > 50000"))
+            .to("amqp:queue:comprovantes.alto-valor")   // antifraude reforçada
+        .otherwise()
+            .to("amqp:queue:comprovantes.padrao");
+```
 
-    private final ComprovanteRepository repo;
+O ponto que **desfaz a confusão do colega**: Camel **não é uma fila** e **não é uma estratégia de saga**. É a *cola* que conecta e medeia sistemas heterogêneos. E a diferença que importa hoje: o Camel clássico podia ser usado **como** um ESB (um hub central de integração); o Camel moderno é usado tipicamente como **biblioteca de integração dentro de um microsserviço** (ou um pequeno serviço de integração dedicado) — "smart endpoint", não barramento central. Mesma ferramenta, filosofia de implantação oposta.
 
-    public ConsultaComprovanteService(ComprovanteRepository repo) {
-        this.repo = repo;
+### O mapa de uma frase
+
+| Camada | O que é | Exemplos | Decide o fluxo de negócio? |
+|---|---|---|---|
+| **Transporte (broker)** | Entrega durável de mensagens | RabbitMQ, Kafka, IBM MQ, Azure Service Bus | Não — só transporta |
+| **Mediação (integração)** | Rotear, transformar, adaptar protocolo | Apache Camel, ESB clássico | Não — só conecta/medeia |
+| **Coordenação** | Quem decide o próximo passo | Orquestrador (Saga), coreografia | **Sim** — é decisão de arquitetura |
+
+Quando alguém disser "usamos um barramento", a pergunta certa é: *"barramento como transporte (broker) ou como mediação central esperta (ESB)?"* — são coisas muito diferentes.
+
+---
+
+## 7. Recap: entidade, value object e agregado — com código
+
+A turma sinalizou que **entidade** e **agregado** escorregam — e a raiz da confusão é uma pergunta justa: *"a `Fatura` tem `id`, então ela é entidade ou agregado?"*. A resposta que desfaz o nó:
+
+> **"Entidade" e "agregado" não são categorias rivais.** Entidade × value object é uma decisão sobre **um objeto**. Agregado é uma decisão sobre **um grupo de objetos**. A **raiz de um agregado é sempre uma entidade** — ter `id` não a impede de ser raiz; é justamente o que a qualifica.
+
+São, portanto, **duas perguntas independentes**:
+
+**Pergunta 1 — para cada objeto: entidade ou value object?**
+- **Entidade:** tem **identidade própria + ciclo de vida**. É "a mesma" ao longo do tempo, mesmo mudando de estado. Igualdade **por id**. (`Comprovante` vai de `ACEITO`→`GRAVADO` e continua o mesmo.)
+- **Value object:** **sem identidade**, definido **só pelos valores**, **imutável**. Igualdade por valor; você não altera, cria outro. (`ChavePix`, `Dinheiro`.)
+- A heurística que decide: **"eu me importo com *qual* é este, ou só com *o que* é este?"** Se preciso distinguir, rastrear ou mudar o estado deste em particular → **entidade**. Se só importam os valores → **VO**.
+
+**Pergunta 2 — para um grupo de objetos: onde fica a fronteira do agregado?**
+- **Agregado** = um *cluster* de objetos (entidades + VOs) que **mudam juntos** sob uma **invariante** comum, com uma **raiz** (sempre uma entidade) como **única porta de entrada**. Ninguém de fora toca os membros internos — só a raiz.
+
+### O caso que confunde: `Lançamento` é entidade ou VO?
+
+Aplique a Pergunta 1 ao `Lançamento`. *"Me importo com qual é este lançamento em particular?"* — **sim**: um lançamento pode ser **contestado** ou **estornado individualmente**, você se refere a "o lançamento nº X", e ele tem **estado que muda** (`NORMAL`→`CONTESTADO`). Logo **`Lançamento` é uma entidade** — só que uma **entidade interna**: tem identidade *dentro* da fatura e é manipulada **apenas através** da `Fatura` (a raiz). Um agregado pode conter **várias entidades**; só uma é a raiz.
+
+> Contraexemplo: se na sua modelagem um lançamento **nunca** é alterado nem referenciado isoladamente — é só "uma linha imutável do extrato" —, então ele seria um **value object**. A resposta depende do **comportamento que o domínio exige**, não do formato dos dados. Por isso não há resposta universal: é uma decisão de projeto.
+
+### Agregado 1 — `Comprovante` (raiz entidade + só VOs)
+
+O agregado mais simples: uma raiz e **nenhuma entidade interna**, só value objects.
+
+```java
+// VALUE OBJECTS — sem id, imutáveis, validados no construtor.
+public record ChavePix(TipoChave tipo, String valor) {
+    public ChavePix {
+        if (valor == null || valor.isBlank())
+            throw new IllegalArgumentException("chave PIX vazia");
+    }
+}
+
+public record Dinheiro(BigDecimal valor, String moeda) {
+    public Dinheiro {
+        if (valor.signum() < 0) throw new IllegalArgumentException("valor negativo");
+    }
+    public Dinheiro soma(Dinheiro o) {
+        if (!moeda.equals(o.moeda)) throw new IllegalArgumentException("moedas diferentes");
+        return new Dinheiro(valor.add(o.valor), moeda);   // retorna NOVO objeto
+    }
+}
+
+// ENTIDADE-RAIZ do agregado Comprovante: tem id e ciclo de vida (o status muda).
+public class Comprovante {                 // aggregate root
+    private final UUID id;                  // identidade — define igualdade
+    private final ChavePix destino;         // VO
+    private final Dinheiro valor;           // VO
+    private StatusComprovante status;       // estado: ACEITO -> GRAVADO
+
+    public Comprovante(UUID id, ChavePix destino, Dinheiro valor) {
+        this.id = id; this.destino = destino; this.valor = valor;
+        this.status = StatusComprovante.ACEITO;
     }
 
-    // Cache-aside: só executa o corpo no MISS; o retorno popula a chave automaticamente.
-    @Cacheable(value = "comprovantes", key = "#id")
-    public Comprovante buscar(UUID id) {
-        return repo.findById(id)
-                   .orElseThrow(() -> new ComprovanteNaoEncontrado(id));
+    public void marcarGravado() {           // única forma de mudar o estado
+        if (status != StatusComprovante.ACEITO)
+            throw new IllegalStateException("só ACEITO pode ir para GRAVADO");
+        this.status = StatusComprovante.GRAVADO;
+    }
+    // equals/hashCode SOMENTE por id
+}
+```
+
+Fronteira do agregado: `{ Comprovante (raiz), ChavePix, Dinheiro }`. Invariante simples — "o status só avança de `ACEITO` para `GRAVADO`". Não há entidade interna: `ChavePix` e `Dinheiro` são VOs.
+
+### Agregado 2 — `Fatura` (raiz entidade + entidade interna + VO)
+
+Agora um agregado com uma **entidade interna** (`Lançamento`) e uma **invariante de verdade**: *o total da fatura é sempre a soma dos lançamentos*.
+
+```java
+// ENTIDADE INTERNA: tem id e ciclo de vida (pode ser contestada), mas é
+// manipulada SÓ através da Fatura — nunca direto de fora (acessores package-private).
+public class Lancamento {
+    private final UUID id;                  // identidade local ao agregado
+    private final String descricao;
+    private final Dinheiro valor;           // VO
+    private StatusLancamento status;        // NORMAL -> CONTESTADO
+
+    Lancamento(UUID id, String descricao, Dinheiro valor) {  // visível só no pacote
+        this.id = id; this.descricao = descricao; this.valor = valor;
+        this.status = StatusLancamento.NORMAL;
+    }
+    UUID id()         { return id; }
+    Dinheiro valor()  { return valor; }
+    void contestar()  { this.status = StatusLancamento.CONTESTADO; }
+}
+
+// ENTIDADE-RAIZ: a única porta de entrada do agregado.
+public class Fatura {                       // aggregate root
+    private final UUID id;
+    private final List<Lancamento> lancamentos = new ArrayList<>();
+    private Dinheiro total;
+    private boolean fechada;
+
+    public Fatura(UUID id, String moeda) {
+        this.id = id;
+        this.total = new Dinheiro(BigDecimal.ZERO, moeda);
     }
 
-    // Invalidação explícita: ao mudar o comprovante, remove a entrada do cache.
-    @CacheEvict(value = "comprovantes", key = "#c.id")
-    public void atualizar(Comprovante c) {
-        repo.save(c);
+    // Mexer nos lançamentos SÓ por aqui — é o que protege a invariante.
+    public void adicionar(String descricao, Dinheiro valor) {
+        if (fechada) throw new IllegalStateException("fatura fechada");
+        lancamentos.add(new Lancamento(UUID.randomUUID(), descricao, valor));
+        recalcularTotal();                  // invariante: total == soma dos lançamentos
+    }
+
+    public void contestar(UUID idLancamento) {
+        lancamentos.stream()
+            .filter(l -> l.id().equals(idLancamento)).findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("lançamento inexistente"))
+            .contestar();                    // muda estado de UMA entidade interna
+    }
+
+    private void recalcularTotal() {
+        this.total = lancamentos.stream()
+            .map(Lancamento::valor)
+            .reduce(new Dinheiro(BigDecimal.ZERO, total.moeda()), Dinheiro::soma);
     }
 }
 ```
 
-> No projeto, a **mesma anotação** roda sobre **Caffeine / embedded-redis** (ambiente pura-JVM, sem Docker) ou sobre **Redis** distribuído (produção): o código de domínio não muda, só o `CacheManager` injetado. Programar contra a **abstração** Spring Cache é o que te dá essa portabilidade — você não amarra a regra de negócio a uma tecnologia de cache, e o mesmo código sobe sem reescrita num serviço Quarkus/Spring com Redis de verdade.
+Repare no que a raiz garante: **não existe** um `lancamento.setValor(...)` chamável de fora, nem um `lancamentoRepository.save(...)` que altere um lançamento sem passar pela `Fatura`. Por isso a invariante (`total == soma`) **nunca** fica inconsistente — toda mudança entra pela porta única e recalcula. É isso que "fronteira de consistência" significa na prática.
+
+Fronteira do agregado: `{ Fatura (raiz), Lancamento* (entidade interna), Dinheiro (VO) }`. `Lancamento` **tem id, mas não é raiz**.
+
+| | Agregado 1 — Comprovante | Agregado 2 — Fatura |
+|---|---|---|
+| Raiz (entidade) | `Comprovante` | `Fatura` |
+| Entidades internas | — (nenhuma) | `Lancamento` |
+| Value objects | `ChavePix`, `Dinheiro` | `Dinheiro` |
+| Invariante protegida | status só avança `ACEITO`→`GRAVADO` | `total == soma dos lançamentos` |
+
+### Por que isso é uma decisão de comunicação
+
+> **Uma transação altera um agregado.** O agregado é a **menor unidade de consistência transacional**. Dentro dele: consistência forte, transação local, **chamada de método — sem rede**. *Entre* agregados (e portanto entre serviços), você não tem transação: é exatamente onde entram mensageria, eventos e SAGA.
+
+Em outras palavras: **se você está precisando de comunicação distribuída e SAGA para algo que está dentro de um mesmo agregado, a fronteira está errada** — junte. E se dois "agregados" só vivem se falando de forma síncrona e transacional, talvez sejam um só. A dor de comunicação distribuída é, muitas vezes, um corte de agregado mal feito vindo à tona. Por isso a Aula 1 (DDD) vem antes desta: **o desenho dos agregados é o que determina o mapa de comunicação** da §8.
 
 ---
 
-## 4. TTL e as três formas de invalidação
+## 8. Mapa de decisão (a colável)
 
-> *"Só existem duas coisas difíceis em computação: invalidação de cache e nomear coisas."* — Phil Karlton
+Diante de "o serviço A precisa que algo aconteça no serviço B", percorra as perguntas **nesta ordem** e pare na primeira que se aplica. Os exemplos usam os agregados da §7 e o fluxo PIX.
 
-A piada é verdadeira porque invalidação é onde a segunda cópia da verdade **mente**. Você tem três caminhos, e a escolha deve ser consciente (registre num ADR):
+1. **B está no mesmo agregado de A?** → Então **não são dois serviços**. Junte; chamada de método; transação local. Pare aqui.
+   > **Exemplo:** adicionar um lançamento e recalcular o total da fatura. `Lancamento` e `Fatura` são o **mesmo agregado** → `fatura.adicionar(...)`, uma transação local. **O erro que delata fronteira mal cortada:** criar um `LancamentoService` que a `Fatura` chama por HTTP para somar — você inventou uma transação distribuída para proteger uma invariante (`total == soma`) que era **local**.
 
-- **TTL (time-to-live).** A entrada **expira sozinha** após um tempo. Simples e robusto: aceita uma janela de inconsistência conhecida e limitada. É a rede de segurança — mesmo que você esqueça de invalidar, o dado velho some sozinho. Para o comprovante imutável, um TTL generoso (horas) é seguro, porque o dado não muda.
+2. **A precisa da resposta de B para a própria próxima ação?** → **Síncrono** (REST/gRPC). Aceite o acoplamento de disponibilidade ou proteja com resiliência (Aula 8).
+   > **Exemplo:** antes de **aceitar** o PIX, o emissor precisa saber se a `Conta` tem saldo/limite. Ele não pode responder "aceito, te aviso depois se tinha saldo" → chamada **síncrona** ao serviço de Conta; o "aprovado/negado" decide a próxima ação (aceitar ou recusar).
 
-  ```java
-  // application.yml — TTL por cache, com Redis
-  // spring.cache.redis.time-to-live: 1h
-  ```
+3. **A não precisa esperar, e há um responsável claro pela ação?** → **Comando** assíncrono numa **fila** (Aulas 5–6).
+   > **Exemplo:** PIX aceito; agora é preciso **gravar** o comprovante na base de verdade — lento, mas com **dono claro** (o gravador). Ninguém espera → `GravarComprovanteCommand` numa fila. (É o que a Aula 5 constrói.)
 
-- **Evicção explícita.** No *update*, você **remove** a entrada (`@CacheEvict`). Preciso — o dado novo entra no próximo *miss* — mas exige **disciplina**: todo caminho que altera o dado precisa lembrar de invalidar. Esqueça um, e o cache serve dado velho indefinidamente. (Por isso o TTL como rede de segurança em cima.)
+4. **A não precisa esperar, e quem reage é problema de quem reage?** → **Evento** num **tópico** (Aula 7). Vários consumidores, fan-out.
+   > **Exemplo:** o comprovante **foi gravado**. Quem se importa? Notificação (SMS), antifraude, BI — e amanhã pode surgir um quarto interessado. O gravador não quer saber → publica `ComprovanteGravado` num **tópico**; cada um reage por conta própria.
 
-- **Versionamento de chave.** Em vez de invalidar, você **muda a chave**. A chave inclui uma versão (`comprovante:v2:{id}`); ao "invalidar", você incrementa a versão, e as leituras passam a buscar a chave nova (que dá *miss* e repopula), enquanto a antiga expira por TTL. Elimina o problema de "esquecer de invalidar em algum caminho", ao custo de gerenciar a versão.
+5. **O fluxo cruza vários serviços com passos que podem falhar e precisam ser desfeitos?** → é uma **SAGA** (Aula 2).
+   > **Exemplo:** emissão → gravação → baixa de limite, em bases diferentes; se a baixa falha, é preciso **compensar** a gravação. Orquestre o caminho crítico do dinheiro (auditável) e coreografe os reatores periféricos.
 
-Por que invalidação é difícil, no fundo: **não existe o momento "agora todos sabem"** num sistema distribuído. Entre o dado mudar no banco e a invalidação propagar, há uma janela em que o cache mente. Você não elimina essa janela — você a **escolhe e a limita** (com TTL) ou a **contorna** (com versionamento).
-
----
-
-## 5. Stampede / thundering herd
-
-Considere uma chave **quente** (muito acessada) que **expira**. No instante seguinte, mil requisições simultâneas dão *miss* ao mesmo tempo e **todas** batem no banco para recomputar a mesma coisa. O banco, que estava tranquilo servindo do cache, leva uma pancada súbita — pode até cair. Isso é o **cache stampede** (ou *thundering herd*).
-
-É o detalhe que separa "cache que funcionou na demo" de "cache que aguenta produção". Três mitigações:
-
-- **Lock de recomputação.** Quando a chave expira, **apenas uma** requisição adquire um *lock* e vai ao banco recomputar; as outras esperam o resultado dela (ou servem o valor antigo por um instante). Evita a avalanche, ao custo de um pouco de coordenação.
-- **TTL com jitter.** Em vez de TTL fixo (todas as chaves quentes expirando juntas), some um valor **aleatório** ao TTL (`1h ± 5min`). As expirações se **espalham** no tempo, e nunca há um instante em que tudo expira de uma vez. Barato e muito eficaz.
-- **Request coalescing.** Requisições idênticas e concorrentes para a mesma chave são **fundidas** numa só ida ao banco; todas recebem o mesmo resultado. Variação do lock, no nível da aplicação.
-
-```java
-// TTL com jitter: espalha expirações para evitar stampede.
-private Duration ttlComJitter() {
-    long base = Duration.ofHours(1).toSeconds();
-    long jitter = ThreadLocalRandom.current().nextLong(0, 300); // até +5 min
-    return Duration.ofSeconds(base + jitter);
-}
-```
-
----
-
-## 6. Consistência cache↔banco e métricas
-
-**Consistência.** O cache é uma segunda cópia; a verdade é o banco. A regra de ouro: **o banco é a fonte; o cache é descartável.** Se houver dúvida, o cache deve poder ser jogado fora e reconstruído a partir do banco a qualquer momento, sem perda. Isso te dá uma propriedade preciosa: se o Redis cair, o sistema **degrada** (mais lento, banco mais sobrecarregado) mas **não erra** — continua lendo a verdade do banco. Cache nunca deve ser a única cópia de algo que você não pode perder.
-
-**Métricas.** Sem medir, **você não sabe se o cache ajuda ou só esconde bug**. As duas métricas essenciais:
-
-- **Hit ratio** = hits / (hits + misses). Um cache com hit ratio baixo (digamos, 20%) está pagando o custo de manutenção e consistência sem entregar o benefício — provavelmente você está cacheando dado que muda demais, ou com TTL curto demais. Se o hit ratio é alto (90%+), o cache está fazendo seu trabalho.
-- **Miss penalty** — quanto custa um *miss* (a ida ao banco). Junto com o hit ratio, te diz o impacto real no p99.
-
-Instrumente desde o dia 1. Spring Cache + Micrometer expõem `cache.gets` com tag `result=hit|miss` automaticamente; ligue isso a um dashboard. "Funcionou na demo" não é métrica.
-
----
-
-## 7. Exemplo trabalhado: a consulta de comprovante PIX
-
-Vamos montar o fluxo de consulta do projeto, ponta a ponta, e discutir a decisão mais sutil: **o que fazer quando o comprovante não está em lugar nenhum**.
-
-O fluxo desejado:
-
-```
-   GET /comprovantes/{id}
-            │
-            ▼
-   ┌────────────────┐  HIT   ┌──────────────────┐
-   │  cache (Redis) │ ─────► │ 200 + comprovante│
-   └───────┬────────┘        └──────────────────┘
-           │ MISS
-           ▼
-   ┌────────────────┐  achou ┌──────────────────────────┐
-   │  banco (fonte) │ ─────► │ popula cache + 200       │
-   └───────┬────────┘        └──────────────────────────┘
-           │ não achou
-           ▼
-   ┌──────────────────────────────────────────┐
-   │  3 retentativas (janela da gravação       │
-   │  assíncrona — Aula 2)                     │
-   └───────┬──────────────────────────────────┘
-           │ ainda não achou
-           ▼
-        404 Not Found   (NÃO cacheia o 404)
-```
-
-Por que os **3 retries**? Por causa da consistência eventual da Aula 2. O cliente fez o PIX, recebeu `202`, e consulta **imediatamente** — mas a gravação assíncrona pode ainda estar na janela de processamento. Um `404` aí seria mentira ("seu comprovante não existe") quando a verdade é "ainda não terminou de gravar". As retentativas (com pequeno *backoff*) cobrem essa janela: re-consulta o banco algumas vezes antes de declarar ausência.
-
-**A decisão de ouro: por que NÃO cachear o 404.** Suponha que você cacheasse a ausência ("não achei, guarda 404"). O comprovante chega à base 200ms depois (a gravação terminou) — mas o cache, durante todo o TTL, continua respondendo `404` para um comprovante que **agora existe**. Você transformou uma janela de milissegundos num bug de minutos. Em domínio bancário, "seu comprovante de PIX não existe" sendo servido por um cache desatualizado é exatamente o tipo de erro que gera ticket, reclamação e desconfiança. **Regra: cacheie a presença (o comprovante gravado, imutável), nunca a ausência transitória.**
-
-```java
-@Service
-public class ConsultaComprovante {
-
-    private final ComprovanteRepository repo;
-    private final ComprovanteCache cache; // cache-aside sobre Redis
-
-    public ConsultaComprovante(ComprovanteRepository repo, ComprovanteCache cache) {
-        this.repo = repo;
-        this.cache = cache;
-    }
-
-    public Comprovante consultar(UUID id) {
-        return cache.get(id)                       // 1. tenta o cache
-            .or(() -> buscarComRetentativas(id))   // 2. miss → banco com retries
-            .orElseThrow(() -> new ComprovanteNaoEncontrado(id)); // 3. 404 — não cacheado
-    }
-
-    private Optional<Comprovante> buscarComRetentativas(UUID id) {
-        for (int tentativa = 1; tentativa <= 3; tentativa++) {
-            Optional<Comprovante> achado = repo.findById(id);
-            if (achado.isPresent()) {
-                cache.put(id, achado.get());       // só popula o cache na PRESENÇA
-                return achado;
-            }
-            esperarBackoff(tentativa);             // janela da gravação assíncrona
-        }
-        return Optional.empty();                    // ausência real → 404, sem cachear
-    }
-}
-```
-
----
-
-## 8. Armadilhas comuns
-
-- **Cachear dado que muda toda hora.** Hit ratio baixo (pouco reúso) e risco de inconsistência alto — o pior dos dois mundos. Cache brilha em "lê muito, muda pouco".
-- **TTL infinito "porque é mais rápido".** Sem expiração e sem invalidação, o dado velho fica para sempre. TTL é sua rede de segurança; nunca abra mão dela.
-- **Não medir hit/miss.** Sem métrica, você está apostando, não engenheirando. Pode estar pagando custo de cache sem benefício — e nem sabe.
-- **Cachear a ausência transitória (o 404).** Transforma uma janela de eventual consistency num bug persistente. Cacheie presença, não ausência.
-- **Tratar o cache como fonte da verdade.** Se perder o cache te faz perder dado, você não tem cache — tem um banco frágil. Cache é sempre descartável.
+6. **B é um sistema heterogêneo que fala outro formato/protocolo?** → camada de **integração** (Camel), preferencialmente como *smart endpoint*, não como ESB central.
+   > **Exemplo:** o antifraude legado roda no mainframe e só aceita arquivo de **largura fixa**, não JSON. Você precisa **transformar e rotear** entre o seu evento e o formato dele → uma **rota Camel** dedicada, não acoplar essa tradução dentro do serviço de negócio.
 
 ---
 
 ## 9. Ponte com o legado Caixa
 
-Muita aplicação legado já "cacheia" — só que mal. O padrão clássico é cachear em **tabela de banco** (uma tabela "de apoio" lida no lugar da consulta cara) ou na **memória do *app server*** com **sessão pegajosa**. Funciona maravilhosamente bem... até você precisar da **segunda instância**. Aí as visões divergem (cada *app server* com seu cache), a invalidação numa não chega na outra, e aparece o bug fantasma "funciona num servidor e não no outro".
+Quase tudo desta aula a turma **já viveu**, com outros nomes:
 
-Redis é a **evolução natural** desse instinto que o veterano já tem: é o mesmo conceito de "guardar o resultado caro para reusar", mas **fora do processo** e **compartilhado** entre todas as instâncias. O veterano que entende por que a sessão pegajosa quebra em escala entende, sem esforço, por que Redis existe — e vira o melhor revisor de decisões de cache da sala.
+- **IBM MQ / MQSeries / JMS** = o broker. "Aceitar agora, processar depois" nasceu no mundo dos grandes processadores transacionais, não na nuvem. Quem operou filas de entrada/saída do mainframe já fez producer/consumer décadas atrás.
+- **O ESB corporativo** (o "barramento" que muita integração da Caixa atravessa) = a mediação central esperta. Conhecer suas dores — SPOF, fila de deploy no time do barramento, transformação opaca — é entender **por que** os serviços novos (Quarkus/Spring) preferem broker burro + endpoints espertos.
+- **Orquestração por job control / stored procedure** = a SAGA orquestrada implícita do mainframe — só que escondida e sem compensação explícita.
+
+O que muda não é o conceito; é o **ferramental e a filosofia de implantação**: do barramento central para o broker gerenciado (Azure Service Bus); da esperteza central para o serviço autônomo; da capacidade fixa para a escala elástica. Quem vem do legado costuma entender o **porquê** mais rápido — porque já sentiu a dor que cada escolha moderna tenta evitar.
 
 ---
 
 ## 10. IA & agentes hoje
 
-Cache deixou de ser "otimização" e virou **requisito econômico** quando a coisa cara de computar passou a ser uma chamada de LLM, não uma query:
+Os mesmos três eixos governam sistemas de IA — e a fronteira de **bounded context** vira a fronteira do **agente**:
 
-- **Semantic caching.** Respostas de LLM podem ser cacheadas por **similaridade de embedding**, não por chave exata. Duas perguntas com palavras diferentes mas **significado parecido** ("qual meu saldo?" / "quanto tenho na conta?") reusam a mesma resposta cacheada. Corta latência e, principalmente, **custo** — você não paga uma inferência nova para uma pergunta semanticamente repetida.
-- **Redis como vector store.** O mesmo Redis que cacheia comprovante serve de **índice vetorial** para **RAG** (Retrieval-Augmented Generation): você guarda embeddings de documentos e busca por similaridade os trechos relevantes para alimentar o prompt. Cache e busca vetorial convivem na mesma infra.
-- **Cache como requisito econômico da inferência.** Uma chamada de LLM é **ordens de magnitude** mais cara e lenta que uma leitura de banco. No mundo transacional, cache economizava milissegundos e capacidade de banco; no mundo de IA, cache economiza **dólares por requisição** e segundos de espera. A mentalidade muda: cache deixa de ser "se sobrar tempo, otimizo" e passa a ser parte do **design de custo** do sistema desde o primeiro dia.
-
-E note a continuidade com a Aula 2: a saída de um passo de agente é **não-determinística**, então cachear essa saída pela chave da tarefa serve a **dois** propósitos — economia (não rechamar o modelo) e **idempotência** (o *retry* devolve o mesmo resultado, sem repetir efeito).
+- **EDA para agentes:** um sistema multiagente maduro raramente é uma corrente síncrona de chamadas. Agentes **publicam eventos** ("documento analisado", "resposta gerada") e outros reagem — coreografia. O orquestrador-agente, quando existe, manda **comandos** ("pesquise isto") — orquestração. É o mesmo trade-off observabilidade × desacoplamento, agora com passos não-determinísticos.
+- **Message bus de agentes:** protocolos emergentes de comunicação entre agentes (agente-para-agente, *tool use* via servidores) são, no fundo, a escolha "broker burro + endpoints espertos" reaparecendo: transporte simples, inteligência no agente.
+- **Camel/EIP para IA:** rotear, transformar e agregar continua valendo quando o "endpoint" é um LLM — *content-based routing* para escolher o modelo, *aggregator* para juntar respostas de vários agentes. EIP não envelheceu; ganhou um conector novo.
+- **A opacidade da coreografia piora com IA:** se já é difícil depurar uma cadeia de eventos, imagine quando cada reator é não-determinístico. Por isso **correlation id** e observabilidade deixam de ser higiene e viram requisito.
 
 ---
 
 ## 11. Para ir além
 
-- **Documentação Redis** — *Caching strategies* e *Key eviction / TTL* (redis.io/docs): as estratégias da §3 e a invalidação da §4, da fonte.
-- **Martin Fowler**, *Patterns of Enterprise Application Architecture* — os padrões de cache e *Lazy Load*.
-- **Spring Framework** — *Cache Abstraction* (`@Cacheable`, `@CacheEvict`, `CacheManager`): a portabilidade Redis↔Caffeine do projeto.
-- **Redis as a Vector Database** — docs de busca vetorial e *semantic caching* para RAG.
+- **Gregor Hohpe & Bobby Woolf**, *Enterprise Integration Patterns* — a bíblia da mediação (a base do Camel). Os padrões que você vai reencontrar a vida toda.
+- **Sam Newman**, *Building Microservices* (cap. de comunicação) — orquestração × coreografia, síncrono × assíncrono, com a honestidade dos trade-offs.
+- **Martin Fowler**, *"What do you mean by Event-Driven?"* e *"MicroservicesAndTheESB" / "smart endpoints, dumb pipes"* — os textos que separam EDA de barramento esperto.
+- **Apache Camel** — *Camel in Action* / a doc de rotas, para ver os EIP virarem código.
 
-> **Na próxima aula:** o cache aliviou a leitura, mas a **escrita** continua com um gargalo de design: o gravador é mais lento e mais frágil que a emissão. Por que fazer a emissão **esperar** por ele? Entra o processamento **assíncrono** — a fila que desacopla emissão de gravação, transforma o `202 Accepted` numa promessa honesta e fecha o circuito que a SAGA da Aula 2 desenhou.
+> **Na próxima aula (Aula 4 — Cache):** você mapeou *como* os serviços conversam. Antes de construir essa comunicação na prática (Aula 5), atacamos um gargalo ortogonal mas urgente para o seu projeto: a operação mais frequente do PIX — a **consulta** de comprovante — está martelando o banco a cada chamada. E quando forem milhões por dia? A Aula 4 alivia essa leitura com **cache** (Redis): estratégias (cache-aside, write-through…), TTL e o problema mais difícil de todos — a **invalidação**. Depois dela (Aula 5) voltamos ao eixo síncrono→assíncrono para construir o `POST` que responde `202` e publica um comando.
